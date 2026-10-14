@@ -12,6 +12,7 @@ import {
 import {
   AXIS_DELTAS,
   BASE_SCALE,
+  GhostCandidate,
   ScreenPoint,
   blockDepth,
   blockToLattice,
@@ -19,6 +20,7 @@ import {
   findBestGhostCandidate,
   getBlockRhombuses,
   latticeToScreen,
+  resolveGhostAtLattice,
 } from './engine/isometricEngine';
 import { COLOR_THEMES, SHAPE_PRESETS } from './engine/presets';
 import {
@@ -94,6 +96,30 @@ export default function App() {
   // Selected / active block for keyboard or compass extrusion
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
 
+  // Keyboard Next-Block Cursor state (Arrow keys move next block, Spacebar adds block)
+  const [inputMode, setInputMode] = useState<'mouse' | 'keyboard'>('keyboard');
+  const [lastBuildDir, setLastBuildDir] = useState<AxisDirection>('+Y');
+  const [kbGhost, setKbGhost] = useState<{
+    u: number;
+    v: number;
+    x: number;
+    y: number;
+    z: number;
+    movedSincePlace: boolean;
+  }>(() => {
+    const last = initialPreset.blocks[initialPreset.blocks.length - 1] ?? { x: 0, y: 0, z: 0 };
+    const lc = blockToLattice(last.x, last.y, last.z);
+    const d = AXIS_DELTAS['+X'];
+    return {
+      u: lc.u + d.du,
+      v: lc.v + d.dv,
+      x: last.x + d.dx,
+      y: last.y + d.dy,
+      z: last.z + d.dz,
+      movedSincePlace: false,
+    };
+  });
+
   // Pan & Zoom state
   const [zoom, setZoom] = useState<number>(1.05);
   const [pan, setPan] = useState<ScreenPoint>({ x: 0, y: 0 });
@@ -106,6 +132,27 @@ export default function App() {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [cursorWorld, setCursorWorld] = useState<ScreenPoint | null>(null);
   const [hoveredBlockId, setHoveredBlockId] = useState<string | null>(null);
+
+  // Helper to position the keyboard ghost one step along `dir` from a reference block
+  const syncKbGhostFromBlock = useCallback(
+    (refBlock: { x: number; y: number; z: number } | undefined, dir: AxisDirection = lastBuildDir) => {
+      if (!refBlock) {
+        setKbGhost({ u: 0, v: 0, x: 0, y: 0, z: 0, movedSincePlace: false });
+        return;
+      }
+      const lc = blockToLattice(refBlock.x, refBlock.y, refBlock.z);
+      const d = AXIS_DELTAS[dir];
+      setKbGhost({
+        u: lc.u + d.du,
+        v: lc.v + d.dv,
+        x: refBlock.x + d.dx,
+        y: refBlock.y + d.dy,
+        z: refBlock.z + d.dz,
+        movedSincePlace: false,
+      });
+    },
+    [lastBuildDir]
+  );
 
   // Push snapshot to history before mutating state
   const commitChange = useCallback(
@@ -128,7 +175,10 @@ export default function App() {
     setFuture((prev) => [{ blocks, connectionModes }, ...prev]);
     setBlocks(previous.blocks);
     setConnectionModes(previous.connectionModes);
-  }, [past, blocks, connectionModes]);
+    const lastBlock = previous.blocks[previous.blocks.length - 1];
+    setSelectedBlockId(lastBlock?.id ?? null);
+    syncKbGhostFromBlock(lastBlock, lastBuildDir);
+  }, [past, blocks, connectionModes, lastBuildDir, syncKbGhostFromBlock]);
 
   const handleRedo = useCallback(() => {
     if (future.length === 0) return;
@@ -137,9 +187,12 @@ export default function App() {
     setPast((prev) => [...prev, { blocks, connectionModes }]);
     setBlocks(next.blocks);
     setConnectionModes(next.connectionModes);
-  }, [future, blocks, connectionModes]);
+    const lastBlock = next.blocks[next.blocks.length - 1];
+    setSelectedBlockId(lastBlock?.id ?? null);
+    syncKbGhostFromBlock(lastBlock, lastBuildDir);
+  }, [future, blocks, connectionModes, lastBuildDir, syncKbGhostFromBlock]);
 
-  // Compute effective connection modes (if autoConnect is off, default unseen connections to 'disconnected')
+  // Compute scene geometry & Escher connections
   const scene = useMemo(() => {
     return buildEscherScene(blocks, connectionModes, orientation, BASE_SCALE);
   }, [blocks, connectionModes, orientation]);
@@ -177,7 +230,9 @@ export default function App() {
   useEffect(() => {
     centerViewOnBlocks(blocks, orientation);
     if (blocks.length > 0) {
-      setSelectedBlockId(blocks[blocks.length - 1].id);
+      const last = blocks[blocks.length - 1];
+      setSelectedBlockId(last.id);
+      syncKbGhostFromBlock(last, '+X');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -196,24 +251,74 @@ export default function App() {
     setPeekAmount(0);
     commitChange(newBlocks, preset.connectionOverrides ?? {});
     centerViewOnBlocks(newBlocks, nextOrientation);
-    if (newBlocks.length > 0) {
-      setSelectedBlockId(newBlocks[newBlocks.length - 1].id);
-    }
+    const last = newBlocks[newBlocks.length - 1];
+    setSelectedBlockId(last?.id ?? null);
+    syncKbGhostFromBlock(last, '+Y');
   };
 
-  // Ghost block candidate when in 'build' mode
-  const ghostCandidate = useMemo(() => {
-    if (toolMode !== 'build' || !cursorWorld || isPanning || Math.abs(peekAmount) > 0.01) {
+  // Active Ghost Block Candidate (combines Keyboard arrow-key cursor and Mouse hover)
+  const ghostCandidate: GhostCandidate | null = useMemo(() => {
+    if (toolMode !== 'build' || isPanning || Math.abs(peekAmount) > 0.01) {
       return null;
     }
-    return findBestGhostCandidate(cursorWorld.x, cursorWorld.y, blocks, orientation, BASE_SCALE);
-  }, [toolMode, cursorWorld, isPanning, peekAmount, blocks, orientation]);
 
-  // Add a block at (x, y, z)
+    if (inputMode === 'keyboard') {
+      return resolveGhostAtLattice(
+        kbGhost.u,
+        kbGhost.v,
+        { x: kbGhost.x, y: kbGhost.y, z: kbGhost.z },
+        blocks,
+        selectedBlockId,
+        orientation,
+        BASE_SCALE
+      );
+    }
+
+    if (cursorWorld) {
+      const mouseCand = findBestGhostCandidate(
+        cursorWorld.x,
+        cursorWorld.y,
+        blocks,
+        orientation,
+        BASE_SCALE
+      );
+      if (mouseCand) return mouseCand;
+    }
+
+    return resolveGhostAtLattice(
+      kbGhost.u,
+      kbGhost.v,
+      { x: kbGhost.x, y: kbGhost.y, z: kbGhost.z },
+      blocks,
+      selectedBlockId,
+      orientation,
+      BASE_SCALE
+    );
+  }, [
+    toolMode,
+    isPanning,
+    peekAmount,
+    inputMode,
+    kbGhost,
+    blocks,
+    selectedBlockId,
+    orientation,
+    cursorWorld,
+  ]);
+
+  // Add a block at (x, y, z) and advance the next-block cursor along `advanceDir`
   const addBlockAt = useCallback(
-    (x: number, y: number, z: number) => {
-      // Avoid exact 3D duplicate
-      if (blocks.some((b) => b.x === x && b.y === y && b.z === z)) return;
+    (x: number, y: number, z: number, advanceDir?: AxisDirection) => {
+      const targetLC = blockToLattice(x, y, z);
+      const stepDir = advanceDir ?? lastBuildDir;
+
+      // If an existing block already occupies this exact 3D coordinate, just select it and advance ghost
+      const exactExisting = blocks.find((b) => b.x === x && b.y === y && b.z === z);
+      if (exactExisting) {
+        setSelectedBlockId(exactExisting.id);
+        syncKbGhostFromBlock(exactExisting, stepDir);
+        return;
+      }
 
       const newBlock: VoxelBlock = {
         id: `b_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -236,15 +341,89 @@ export default function App() {
 
       commitChange(nextBlocks, nextModes);
       setSelectedBlockId(newBlock.id);
+      if (advanceDir) {
+        setLastBuildDir(advanceDir);
+      }
+
+      // Advance the keyboard ghost one step further in `stepDir` so repeated Spacebar presses build a beam
+      const d = AXIS_DELTAS[stepDir];
+      setKbGhost({
+        u: targetLC.u + d.du,
+        v: targetLC.v + d.dv,
+        x: x + d.dx,
+        y: y + d.dy,
+        z: z + d.dz,
+        movedSincePlace: false,
+      });
     },
-    [blocks, connectionModes, autoConnect, orientation, commitChange]
+    [blocks, connectionModes, autoConnect, orientation, lastBuildDir, commitChange, syncKbGhostFromBlock]
+  );
+
+  // Move the "Next Block" ghost cursor using Arrow keys (or Q/E)
+  const moveNextBlockCursor = useCallback(
+    (dir: AxisDirection) => {
+      setToolMode('build');
+      setInputMode('keyboard');
+      setLastBuildDir(dir);
+
+      const delta = AXIS_DELTAS[dir];
+      const anchor =
+        blocks.find((b) => b.id === selectedBlockId) ?? blocks[blocks.length - 1];
+
+      setKbGhost((prev) => {
+        // First arrow press right after placing a block branches directly from the anchor block's face
+        const base =
+          !prev.movedSincePlace && anchor
+            ? {
+                u: blockToLattice(anchor.x, anchor.y, anchor.z).u,
+                v: blockToLattice(anchor.x, anchor.y, anchor.z).v,
+                x: anchor.x,
+                y: anchor.y,
+                z: anchor.z,
+              }
+            : prev;
+
+        const nu = base.u + delta.du;
+        const nv = base.v + delta.dv;
+        const nx = base.x + delta.dx;
+        const ny = base.y + delta.dy;
+        const nz = base.z + delta.dz;
+
+        // If the user steered back onto the anchor block itself, reset movedSincePlace so next arrow picks a face
+        if (anchor) {
+          const alc = blockToLattice(anchor.x, anchor.y, anchor.z);
+          if (nu === alc.u && nv === alc.v) {
+            return {
+              u: alc.u,
+              v: alc.v,
+              x: anchor.x,
+              y: anchor.y,
+              z: anchor.z,
+              movedSincePlace: false,
+            };
+          }
+        }
+
+        return {
+          u: nu,
+          v: nv,
+          x: nx,
+          y: ny,
+          z: nz,
+          movedSincePlace: true,
+        };
+      });
+    },
+    [blocks, selectedBlockId]
   );
 
   // Step-extrude from the currently selected (or last) block along one of the 6 isometric directions
   const handleExtrudeDirection = useCallback(
     (dir: AxisDirection) => {
+      setInputMode('keyboard');
+      setLastBuildDir(dir);
       if (blocks.length === 0) {
-        addBlockAt(0, 0, 0);
+        addBlockAt(0, 0, 0, dir);
         return;
       }
       const anchor =
@@ -262,14 +441,14 @@ export default function App() {
       });
 
       if (existingAtCell) {
-        // Select that block so user can continue chaining from it
         setSelectedBlockId(existingAtCell.id);
+        syncKbGhostFromBlock(existingAtCell, dir);
         return;
       }
 
-      addBlockAt(nx, ny, nz);
+      addBlockAt(nx, ny, nz, dir);
     },
-    [blocks, selectedBlockId, addBlockAt]
+    [blocks, selectedBlockId, addBlockAt, syncKbGhostFromBlock]
   );
 
   // Remove a block by ID
@@ -278,10 +457,12 @@ export default function App() {
       const nextBlocks = blocks.filter((b) => b.id !== id);
       commitChange(nextBlocks, connectionModes);
       if (selectedBlockId === id) {
-        setSelectedBlockId(nextBlocks.length > 0 ? nextBlocks[nextBlocks.length - 1].id : null);
+        const nextAnchor = nextBlocks.length > 0 ? nextBlocks[nextBlocks.length - 1] : undefined;
+        setSelectedBlockId(nextAnchor?.id ?? null);
+        syncKbGhostFromBlock(nextAnchor, lastBuildDir);
       }
     },
-    [blocks, connectionModes, selectedBlockId, commitChange]
+    [blocks, connectionModes, selectedBlockId, lastBuildDir, commitChange, syncKbGhostFromBlock]
   );
 
   // Cycle an Escher connection's mode: natural -> flipped -> disconnected -> natural
@@ -325,6 +506,7 @@ export default function App() {
       return;
     }
 
+    setInputMode('mouse');
     const world = clientToWorld(e.clientX, e.clientY);
     setCursorWorld(world);
 
@@ -346,7 +528,7 @@ export default function App() {
   };
 
   const handleMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
-    // Middle click or Shift+click or Spacebar panning
+    // Middle click or Shift+click panning
     if (e.button === 1 || (e.button === 0 && e.shiftKey)) {
       e.preventDefault();
       setIsPanning(true);
@@ -389,9 +571,16 @@ export default function App() {
 
     if (toolMode === 'build') {
       if (ghostCandidate) {
-        addBlockAt(ghostCandidate.x, ghostCandidate.y, ghostCandidate.z);
+        addBlockAt(
+          ghostCandidate.x,
+          ghostCandidate.y,
+          ghostCandidate.z,
+          ghostCandidate.direction
+        );
       } else if (hoveredBlockId) {
         setSelectedBlockId(hoveredBlockId);
+        const b = blocks.find((blk) => blk.id === hoveredBlockId);
+        syncKbGhostFromBlock(b, lastBuildDir);
       }
     }
   };
@@ -416,7 +605,7 @@ export default function App() {
     }
   };
 
-  // Keyboard shortcuts
+  // Keyboard shortcuts: Arrow keys move the next block, Spacebar places the block!
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
@@ -431,6 +620,59 @@ export default function App() {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
         return;
       }
+
+      // Arrow keys move the next block cursor
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        moveNextBlockCursor('+X');
+        return;
+      }
+      if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        moveNextBlockCursor('-X');
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        moveNextBlockCursor(e.shiftKey ? '-Y' : '+Z');
+        return;
+      }
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        moveNextBlockCursor(e.shiftKey ? '+Y' : '-Z');
+        return;
+      }
+      if (e.key.toLowerCase() === 'q') {
+        e.preventDefault();
+        moveNextBlockCursor('-Y');
+        return;
+      }
+      if (e.key.toLowerCase() === 'e') {
+        e.preventDefault();
+        moveNextBlockCursor('+Y');
+        return;
+      }
+
+      // Spacebar places the block at the current ghost position
+      if (e.code === 'Space' || e.key === ' ') {
+        e.preventDefault();
+        if (Math.abs(peekAmount) > 0.01) {
+          setPeekAmount(0);
+          return;
+        }
+        setToolMode('build');
+        setInputMode('keyboard');
+        if (ghostCandidate) {
+          addBlockAt(
+            ghostCandidate.x,
+            ghostCandidate.y,
+            ghostCandidate.z,
+            ghostCandidate.direction ?? lastBuildDir
+          );
+        }
+        return;
+      }
+
       if (e.key === '1') setToolMode('build');
       if (e.key === '2') setToolMode('erase');
       if (e.key === '3') setToolMode('connect');
@@ -444,7 +686,18 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [handleUndo, handleRedo, selectedBlockId, blocks.length, removeBlockById]);
+  }, [
+    handleUndo,
+    handleRedo,
+    moveNextBlockCursor,
+    peekAmount,
+    ghostCandidate,
+    addBlockAt,
+    lastBuildDir,
+    selectedBlockId,
+    blocks.length,
+    removeBlockById,
+  ]);
 
   // Generate clean standalone SVG string for export
   const generateExportSvgString = useCallback((): string => {
@@ -704,28 +957,63 @@ export default function App() {
             )}
           </div>
 
-          {/* 6-Direction Step Builder Pad */}
-          <div className="p-3 rounded-xl bg-neutral-950/80 border border-neutral-800 space-y-2">
+          {/* 6-Direction Step Builder Pad + Keyboard Controls */}
+          <div className="p-3 rounded-xl bg-neutral-950/80 border border-neutral-800 space-y-2.5">
             <div className="flex items-center justify-between">
               <span className="text-[11px] font-semibold uppercase tracking-wider text-neutral-400 flex items-center gap-1.5">
                 <Compass className="w-3.5 h-3.5 text-amber-400" />
-                3D Axis Step Builder
+                Move Next Block
               </span>
-              <span className="text-[10px] text-neutral-500">From selected block</span>
+              <span className="text-[10px] font-mono text-amber-300/90">Arrows + Space</span>
             </div>
-            <div className="grid grid-cols-3 gap-1.5 pt-1">
-              {(['+X', '+Y', '+Z', '-X', '-Y', '-Z'] as AxisDirection[]).map((dir) => (
-                <button
-                  key={dir}
-                  onClick={() => handleExtrudeDirection(dir)}
-                  className="px-2 py-1.5 rounded-lg bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 hover:border-amber-500/40 text-xs font-mono text-neutral-200 flex items-center justify-center gap-1 transition"
-                  title={`Add block along ${AXIS_DELTAS[dir].label}`}
-                >
-                  <Plus className="w-3 h-3 text-amber-400" />
-                  {dir}
-                </button>
-              ))}
+            <div className="grid grid-cols-3 gap-1.5 pt-0.5">
+              {(
+                [
+                  { dir: '+X', keyHint: '←' },
+                  { dir: '+Y', keyHint: 'E / ⇧↓' },
+                  { dir: '+Z', keyHint: '↑' },
+                  { dir: '-X', keyHint: '→' },
+                  { dir: '-Y', keyHint: 'Q / ⇧↑' },
+                  { dir: '-Z', keyHint: '↓' },
+                ] as Array<{ dir: AxisDirection; keyHint: string }>
+              ).map(({ dir, keyHint }) => {
+                const isCurrentDir = ghostCandidate?.direction === dir;
+                return (
+                  <button
+                    key={dir}
+                    onClick={() => moveNextBlockCursor(dir)}
+                    className={`px-2 py-1.5 rounded-lg border text-xs font-mono flex flex-col items-center justify-center gap-0.5 transition ${
+                      isCurrentDir
+                        ? 'bg-amber-500/20 border-amber-500 text-amber-200'
+                        : 'bg-neutral-900 hover:bg-neutral-800 border-neutral-800 hover:border-amber-500/40 text-neutral-200'
+                    }`}
+                    title={`Move next block along ${AXIS_DELTAS[dir].label} (${keyHint})`}
+                  >
+                    <span className="font-bold">{dir}</span>
+                    <span className="text-[9px] text-neutral-400">{keyHint}</span>
+                  </button>
+                );
+              })}
             </div>
+            <button
+              onClick={() => {
+                if (ghostCandidate) {
+                  addBlockAt(
+                    ghostCandidate.x,
+                    ghostCandidate.y,
+                    ghostCandidate.z,
+                    ghostCandidate.direction ?? lastBuildDir
+                  );
+                }
+              }}
+              className="w-full py-2 px-3 rounded-lg bg-amber-500 hover:bg-amber-400 text-neutral-950 text-xs font-bold flex items-center justify-center gap-1.5 shadow-md shadow-amber-500/15 transition"
+            >
+              <Plus className="w-3.5 h-3.5 stroke-[2.5]" />
+              <span>Add Next Block</span>
+              <kbd className="ml-1 px-1.5 py-0.5 text-[10px] font-mono bg-neutral-950/20 rounded">
+                Space
+              </kbd>
+            </button>
           </div>
 
           {/* Shape Presets Gallery */}
@@ -785,9 +1073,12 @@ export default function App() {
 
           <button
             onClick={() => {
+              const starter = { id: `b_${Date.now()}_0`, x: 0, y: 0, z: 0 };
               setActivePresetId('custom');
-              commitChange([{ id: `b_${Date.now()}_0`, x: 0, y: 0, z: 0 }], {});
-              centerViewOnBlocks([{ id: '0', x: 0, y: 0, z: 0 }]);
+              commitChange([starter], {});
+              centerViewOnBlocks([starter]);
+              setSelectedBlockId(starter.id);
+              syncKbGhostFromBlock(starter, '+Y');
             }}
             className="flex-1 py-2 px-3 rounded-lg bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 text-xs font-medium text-neutral-300 hover:text-white flex items-center justify-center gap-1.5 transition"
           >
@@ -799,6 +1090,8 @@ export default function App() {
             onClick={() => {
               setActivePresetId('empty');
               commitChange([], {});
+              setSelectedBlockId(null);
+              syncKbGhostFromBlock(undefined);
             }}
             className="p-2 rounded-lg bg-neutral-900 hover:bg-rose-950/60 border border-neutral-800 hover:border-rose-500/40 text-neutral-400 hover:text-rose-300 transition"
             title="Clear Canvas"
@@ -819,13 +1112,15 @@ export default function App() {
               {blocks.length} {blocks.length === 1 ? 'Block' : 'Blocks'}
             </span>
             <span className="text-neutral-700">|</span>
-            <span className="text-neutral-400">
+            <span className="text-neutral-300">
               {toolMode === 'build' &&
                 (ghostCandidate
                   ? ghostCandidate.willEscherConnect
-                    ? '⚡ Click to place & Escher-weld!'
-                    : `Click to add along ${ghostCandidate.direction ?? 'grid'}`
-                  : 'Hover near any block face to add · Right-click to erase')}
+                    ? '⚡ Press Space (or Click) to place & Escher-weld!'
+                    : `Arrow Keys: Move Next Block (${
+                        ghostCandidate.direction ?? 'grid'
+                      }) · Space: Add Block`
+                  : 'Arrow Keys: Move Next Block · Space: Add Block')}
               {toolMode === 'erase' && 'Click any block to remove it'}
               {toolMode === 'connect' &&
                 'Click any ⚡ connection node to flip weave order or disconnect'}
@@ -978,54 +1273,55 @@ export default function App() {
                       points={pointsToSvgPolygon(ghostCandidate.rhombuses.faceX)}
                       fill={theme.faceX}
                       fillOpacity={0.48}
-                      stroke={ghostCandidate.willEscherConnect ? '#f59e0b' : theme.stroke}
-                      strokeWidth={1.8}
-                      strokeDasharray={ghostCandidate.willEscherConnect ? undefined : '4 3'}
+                      stroke={ghostCandidate.willEscherConnect ? '#f59e0b' : '#06b6d4'}
+                      strokeWidth={2.0}
+                      strokeDasharray={ghostCandidate.willEscherConnect ? undefined : '5 3'}
                     />
                     <polygon
                       points={pointsToSvgPolygon(ghostCandidate.rhombuses.faceY)}
                       fill={theme.faceY}
                       fillOpacity={0.48}
-                      stroke={ghostCandidate.willEscherConnect ? '#f59e0b' : theme.stroke}
-                      strokeWidth={1.8}
-                      strokeDasharray={ghostCandidate.willEscherConnect ? undefined : '4 3'}
+                      stroke={ghostCandidate.willEscherConnect ? '#f59e0b' : '#06b6d4'}
+                      strokeWidth={2.0}
+                      strokeDasharray={ghostCandidate.willEscherConnect ? undefined : '5 3'}
                     />
                     <polygon
                       points={pointsToSvgPolygon(ghostCandidate.rhombuses.faceZ)}
                       fill={theme.faceZ}
-                      fillOpacity={0.6}
-                      stroke={ghostCandidate.willEscherConnect ? '#f59e0b' : theme.stroke}
-                      strokeWidth={1.8}
-                      strokeDasharray={ghostCandidate.willEscherConnect ? undefined : '4 3'}
+                      fillOpacity={0.62}
+                      stroke={ghostCandidate.willEscherConnect ? '#f59e0b' : '#06b6d4'}
+                      strokeWidth={2.0}
+                      strokeDasharray={ghostCandidate.willEscherConnect ? undefined : '5 3'}
                     />
-                    {ghostCandidate.willEscherConnect && (
-                      <g
-                        transform={`translate(${ghostCandidate.screenCenter.x}, ${
-                          ghostCandidate.screenCenter.y - 26
-                        })`}
+                    <g
+                      transform={`translate(${ghostCandidate.screenCenter.x}, ${
+                        ghostCandidate.screenCenter.y - 28
+                      })`}
+                    >
+                      <rect
+                        x={ghostCandidate.willEscherConnect ? -68 : -54}
+                        y={-12}
+                        width={ghostCandidate.willEscherConnect ? 136 : 108}
+                        height={22}
+                        rx={11}
+                        fill={ghostCandidate.willEscherConnect ? '#f59e0b' : '#09090b'}
+                        fillOpacity={0.9}
+                        stroke={ghostCandidate.willEscherConnect ? '#000' : '#06b6d4'}
+                        strokeWidth={1.5}
+                      />
+                      <text
+                        x={0}
+                        y={3}
+                        textAnchor="middle"
+                        fill={ghostCandidate.willEscherConnect ? '#09090b' : '#e0f2fe'}
+                        fontSize={10}
+                        fontWeight="bold"
                       >
-                        <rect
-                          x={-54}
-                          y={-12}
-                          width={108}
-                          height={22}
-                          rx={11}
-                          fill="#f59e0b"
-                          stroke="#000"
-                          strokeWidth={1.5}
-                        />
-                        <text
-                          x={0}
-                          y={3}
-                          textAnchor="middle"
-                          fill="#09090b"
-                          fontSize={10}
-                          fontWeight="bold"
-                        >
-                          ⚡ Escher Weld!
-                        </text>
-                      </g>
-                    )}
+                        {ghostCandidate.willEscherConnect
+                          ? '⚡ Escher Weld [Space]'
+                          : `Next ${ghostCandidate.direction ?? ''} [Space]`}
+                      </text>
+                    </g>
                   </g>
                 )}
 

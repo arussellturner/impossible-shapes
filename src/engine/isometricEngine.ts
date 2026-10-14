@@ -920,3 +920,104 @@ export function findBestGhostCandidate(
 
   return bestCandidate;
 }
+
+/**
+ * Resolves a GhostCandidate at a specific 2D lattice coordinate (u, v) for keyboard navigation.
+ * If (u, v) is adjacent to an existing block (preferring preferredAnchorId), snaps its 3D (x, y, z)
+ * to that block's 3D neighbor so it connects seamlessly.
+ */
+export function resolveGhostAtLattice(
+  u: number,
+  v: number,
+  fallbackXYZ: { x: number; y: number; z: number },
+  blocks: VoxelBlock[],
+  preferredAnchorId: string | null,
+  orientation: ViewOrientation,
+  scale: number = BASE_SCALE
+): GhostCandidate {
+  const screenCenter = latticeToScreen(u, v, orientation, scale);
+  const rhombuses = getBlockRhombuses(u, v, orientation, scale);
+
+  if (blocks.length === 0) {
+    return {
+      x: fallbackXYZ.x,
+      y: fallbackXYZ.y,
+      z: fallbackXYZ.z,
+      u,
+      v,
+      label: 'Starter Block (Space to Add)',
+      willEscherConnect: false,
+      escherTargetCount: 0,
+      screenCenter,
+      rhombuses,
+    };
+  }
+
+  // Order blocks so preferredAnchorId is checked first, then most recently added blocks
+  const orderedBlocks: VoxelBlock[] = [];
+  if (preferredAnchorId) {
+    const pref = blocks.find((b) => b.id === preferredAnchorId);
+    if (pref) orderedBlocks.push(pref);
+  }
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    if (blocks[i].id !== preferredAnchorId) {
+      orderedBlocks.push(blocks[i]);
+    }
+  }
+
+  const directions: AxisDirection[] = ['+X', '-X', '+Y', '-Y', '+Z', '-Z'];
+  let matchedBlock: VoxelBlock | undefined;
+  let matchedDir: AxisDirection | undefined;
+
+  for (const b of orderedBlocks) {
+    const blc = blockToLattice(b.x, b.y, b.z);
+    const du = u - blc.u;
+    const dv = v - blc.v;
+    for (const dir of directions) {
+      const info = AXIS_DELTAS[dir];
+      if (info.du === du && info.dv === dv) {
+        matchedBlock = b;
+        matchedDir = dir;
+        break;
+      }
+    }
+    if (matchedBlock) break;
+  }
+
+  const nx = matchedBlock && matchedDir ? matchedBlock.x + AXIS_DELTAS[matchedDir].dx : fallbackXYZ.x;
+  const ny = matchedBlock && matchedDir ? matchedBlock.y + AXIS_DELTAS[matchedDir].dy : fallbackXYZ.y;
+  const nz = matchedBlock && matchedDir ? matchedBlock.z + AXIS_DELTAS[matchedDir].dz : fallbackXYZ.z;
+
+  // Check if placing at (nx, ny, nz) creates any Escher connections with other existing blocks
+  let escherTargetCount = 0;
+  for (const other of blocks) {
+    if (matchedBlock && other.id === matchedBlock.id) continue;
+    const olc = blockToLattice(other.x, other.y, other.z);
+    const odu = olc.u - u;
+    const odv = olc.v - v;
+    for (const dInfo of Object.values(AXIS_DELTAS)) {
+      if (dInfo.du === odu && dInfo.dv === odv) {
+        const kx = other.x - nx - dInfo.dx;
+        if (kx !== 0) {
+          escherTargetCount++;
+        }
+      }
+    }
+  }
+
+  return {
+    x: nx,
+    y: ny,
+    z: nz,
+    u,
+    v,
+    fromBlockId: matchedBlock?.id,
+    direction: matchedDir,
+    label: matchedDir ? AXIS_DELTAS[matchedDir].label : 'Free Lattice Cell',
+    willEscherConnect: escherTargetCount > 0,
+    escherTargetCount,
+    screenCenter,
+    rhombuses,
+  };
+}
+
