@@ -28,9 +28,11 @@ import {
 import { COLOR_THEMES, SHAPE_PRESETS } from './engine/presets';
 import {
   Box,
+  CheckCircle2,
   Compass,
   Download,
   Eraser,
+  ExternalLink,
   Eye,
   FlipHorizontal2,
   Grid,
@@ -38,11 +40,14 @@ import {
   Image as ImageIcon,
   Layers,
   Link2,
+  Loader2,
   Maximize2,
+  MessageSquarePlus,
   Palette,
   Plus,
   Redo2,
   RotateCcw,
+  Send,
   Sparkles,
   Trash2,
   Undo2,
@@ -97,6 +102,23 @@ export default function App() {
   // 3D Illusion Peek state (0 = locked isometric sweet spot, != 0 = tilted 3D reveal)
   const [peekAmount, setPeekAmount] = useState<number>(0);
   const [showHelpModal, setShowHelpModal] = useState<boolean>(false);
+
+  // Suggestion / GitHub Issue Modal state
+  const [showSuggestionModal, setShowSuggestionModal] = useState<boolean>(false);
+  const [suggestionTitle, setSuggestionTitle] = useState<string>('');
+  const [suggestionCategory, setSuggestionCategory] = useState<
+    'enhancement' | 'ux' | 'geometry' | 'bug'
+  >('enhancement');
+  const [suggestionDescription, setSuggestionDescription] = useState<string>('');
+  const [suggestionSubmitter, setSuggestionSubmitter] = useState<string>('');
+  const [includeSceneContext, setIncludeSceneContext] = useState<boolean>(true);
+  const [isSubmittingSuggestion, setIsSubmittingSuggestion] = useState<boolean>(false);
+  const [suggestionError, setSuggestionError] = useState<string | null>(null);
+  const [createdIssue, setCreatedIssue] = useState<{
+    number: number;
+    html_url: string;
+    title: string;
+  } | null>(null);
 
   // Selected / active block for keyboard or compass extrusion
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
@@ -967,6 +989,108 @@ export default function App() {
 
   const activeEscherCount = scene.connections.filter((c) => c.mode !== 'disconnected').length;
 
+  const handleOpenSuggestionModal = () => {
+    setSuggestionError(null);
+    setCreatedIssue(null);
+    setShowSuggestionModal(true);
+  };
+
+  const handleSubmitSuggestion = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const title = suggestionTitle.trim();
+    const description = suggestionDescription.trim();
+    if (!title || !description) {
+      setSuggestionError('Please enter both a suggestion title and description.');
+      return;
+    }
+
+    setIsSubmittingSuggestion(true);
+    setSuggestionError(null);
+
+    const payload = {
+      title,
+      category: suggestionCategory,
+      description,
+      submitter: suggestionSubmitter.trim(),
+      includeSceneContext,
+      sceneContext: {
+        presetId: activePresetId,
+        orientation,
+        blockCount: blocks.length,
+        weldCount: activeEscherCount,
+        blocks: blocks.map((b) => ({ x: b.x, y: b.y, z: b.z })),
+      },
+    };
+
+    try {
+      const res = await fetch('/api/suggestions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        const data = (await res.json()) as {
+          number?: number;
+          html_url?: string;
+          title?: string;
+          error?: string;
+          fallback?: boolean;
+        };
+
+        if (res.ok && data.html_url && data.number) {
+          setCreatedIssue({
+            number: data.number,
+            html_url: data.html_url,
+            title: data.title || title,
+          });
+          setSuggestionTitle('');
+          setSuggestionDescription('');
+          setIsSubmittingSuggestion(false);
+          return;
+        }
+
+        if (!data.fallback && data.error) {
+          throw new Error(data.error);
+        }
+      }
+
+      // Fallback for static hosting without backend middleware: open pre-filled GitHub issue
+      const issueTitle = title.startsWith('[Suggestion]') ? title : `[Suggestion] ${title}`;
+      const bodyLines = [
+        `### Suggestion Summary`,
+        `**Category:** \`${suggestionCategory}\``,
+        suggestionSubmitter.trim() ? `**Submitted by:** ${suggestionSubmitter.trim()}` : '',
+        '',
+        '### Description',
+        description,
+      ].filter(Boolean);
+
+      if (includeSceneContext) {
+        bodyLines.push(
+          '',
+          '---',
+          `**Canvas Context:** Preset \`${activePresetId}\` · ${blocks.length} blocks · ${activeEscherCount} Escher welds`
+        );
+      }
+
+      const fallbackUrl = `https://github.com/arussellturner/impossible-shapes/issues/new?title=${encodeURIComponent(
+        issueTitle
+      )}&body=${encodeURIComponent(bodyLines.join('\n'))}&labels=${encodeURIComponent(
+        suggestionCategory === 'bug' ? 'bug' : 'enhancement'
+      )}`;
+      window.open(fallbackUrl, '_blank', 'noopener,noreferrer');
+      setShowSuggestionModal(false);
+    } catch (err) {
+      setSuggestionError(
+        err instanceof Error ? err.message : 'Could not submit suggestion to GitHub.'
+      );
+    } finally {
+      setIsSubmittingSuggestion(false);
+    }
+  };
+
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-neutral-950 text-neutral-100 font-sans">
       {/* LEFT SIDEBAR: Presets, Tools & Isometric Extrusion Pad */}
@@ -1281,8 +1405,16 @@ export default function App() {
             )}
           </div>
 
-          {/* Right Export Buttons */}
+          {/* Right Action & Export Buttons */}
           <div className="pointer-events-auto flex items-center gap-2">
+            <button
+              onClick={handleOpenSuggestionModal}
+              className="px-3 py-2 rounded-xl bg-neutral-900/90 hover:bg-neutral-800 backdrop-blur-md border border-cyan-500/40 text-xs font-medium text-cyan-200 hover:text-white flex items-center gap-1.5 shadow-lg transition"
+              title="Open suggestion form to file a GitHub Issue on arussellturner/impossible-shapes"
+            >
+              <MessageSquarePlus className="w-3.5 h-3.5 text-cyan-400" />
+              Offer a Suggestion to Improve This
+            </button>
             <button
               onClick={handleExportSvg}
               className="px-3 py-2 rounded-xl bg-neutral-900/90 hover:bg-neutral-800 backdrop-blur-md border border-neutral-800 text-xs font-medium text-neutral-200 flex items-center gap-1.5 shadow-lg transition"
@@ -1936,7 +2068,216 @@ export default function App() {
             )}
           </div>
         </div>
+
+        {/* Right Sidebar Footer: Offer a Suggestion */}
+        <div className="p-3 border-t border-neutral-800 bg-neutral-950/60">
+          <button
+            onClick={handleOpenSuggestionModal}
+            className="w-full py-2.5 px-3 rounded-xl bg-gradient-to-r from-cyan-500/20 to-amber-500/20 hover:from-cyan-500/30 hover:to-amber-500/30 border border-cyan-500/40 text-xs font-semibold text-cyan-200 hover:text-white flex items-center justify-center gap-2 shadow-md transition"
+          >
+            <MessageSquarePlus className="w-4 h-4 text-cyan-400" />
+            <span>Offer a Suggestion to Improve This</span>
+          </button>
+        </div>
       </aside>
+
+      {/* OFFER A SUGGESTION (GITHUB ISSUE) MODAL */}
+      {showSuggestionModal && (
+        <div
+          className="fixed inset-0 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4 z-50"
+          onClick={() => !isSubmittingSuggestion && setShowSuggestionModal(false)}
+        >
+          <div
+            className="max-w-lg w-full rounded-2xl bg-neutral-900 border border-neutral-800 p-6 space-y-4 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-cyan-500/15 border border-cyan-500/30 flex items-center justify-center text-cyan-400">
+                  <MessageSquarePlus className="w-5 h-5" />
+                </div>
+                <div>
+                  <h2 className="text-base font-bold text-white">
+                    Offer a Suggestion to Improve This
+                  </h2>
+                  <p className="text-xs text-neutral-400">
+                    Automatically saved as a GitHub Issue on{' '}
+                    <span className="font-mono text-cyan-300">arussellturner/impossible-shapes</span>
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => !isSubmittingSuggestion && setShowSuggestionModal(false)}
+                className="text-neutral-400 hover:text-white text-sm p-1"
+              >
+                ✕
+              </button>
+            </div>
+
+            {createdIssue ? (
+              <div className="p-4 rounded-xl bg-emerald-950/40 border border-emerald-500/40 space-y-3">
+                <div className="flex items-center gap-2 text-emerald-300 font-semibold text-sm">
+                  <CheckCircle2 className="w-5 h-5 text-emerald-400 flex-shrink-0" />
+                  <span>Suggestion saved as GitHub Issue #{createdIssue.number}!</span>
+                </div>
+                <p className="text-xs text-neutral-300 leading-relaxed">
+                  Thank you! Your suggestion (<strong>{createdIssue.title}</strong>) has been
+                  created in the repository issue tracker.
+                </p>
+                <div className="pt-1 flex items-center justify-between gap-2">
+                  <a
+                    href={createdIssue.html_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="px-3.5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-neutral-950 text-xs font-bold inline-flex items-center gap-1.5 transition"
+                  >
+                    <span>View Issue #{createdIssue.number} on GitHub</span>
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </a>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => setCreatedIssue(null)}
+                      className="px-3 py-2 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-xs font-medium transition"
+                    >
+                      Submit Another
+                    </button>
+                    <button
+                      onClick={() => setShowSuggestionModal(false)}
+                      className="px-3.5 py-2 rounded-xl bg-neutral-950 hover:bg-neutral-800 border border-neutral-700 text-neutral-200 text-xs font-medium transition"
+                    >
+                      Close
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <form onSubmit={handleSubmitSuggestion} className="space-y-3.5">
+                {/* Category Selector */}
+                <div>
+                  <label className="block text-[11px] font-semibold uppercase tracking-wider text-neutral-400 mb-1.5">
+                    Category
+                  </label>
+                  <div className="grid grid-cols-4 gap-1.5">
+                    {(
+                      [
+                        { id: 'enhancement', label: 'Feature Idea' },
+                        { id: 'ux', label: 'UI / Controls' },
+                        { id: 'geometry', label: 'Weld / 3D' },
+                        { id: 'bug', label: 'Bug Report' },
+                      ] as const
+                    ).map((cat) => (
+                      <button
+                        type="button"
+                        key={cat.id}
+                        onClick={() => setSuggestionCategory(cat.id)}
+                        className={`py-1.5 px-2 rounded-lg text-xs font-medium border transition ${
+                          suggestionCategory === cat.id
+                            ? 'bg-cyan-500/20 border-cyan-400 text-cyan-200 font-semibold'
+                            : 'bg-neutral-950 border-neutral-800 text-neutral-400 hover:text-white'
+                        }`}
+                      >
+                        {cat.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Title */}
+                <div>
+                  <label className="block text-[11px] font-semibold uppercase tracking-wider text-neutral-400 mb-1">
+                    Short Summary / Title *
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={suggestionTitle}
+                    onChange={(e) => setSuggestionTitle(e.target.value)}
+                    placeholder="e.g., Add keyboard shortcut to rotate the entire shape"
+                    className="w-full px-3 py-2 rounded-xl bg-neutral-950 border border-neutral-800 focus:border-cyan-400 focus:outline-none text-xs text-white placeholder-neutral-500"
+                  />
+                </div>
+
+                {/* Description */}
+                <div>
+                  <label className="block text-[11px] font-semibold uppercase tracking-wider text-neutral-400 mb-1">
+                    Suggestion Details *
+                  </label>
+                  <textarea
+                    required
+                    rows={4}
+                    value={suggestionDescription}
+                    onChange={(e) => setSuggestionDescription(e.target.value)}
+                    placeholder="Describe how we can improve EscherCAD, what workflow you'd like to see, or what behaved unexpectedly..."
+                    className="w-full px-3 py-2 rounded-xl bg-neutral-950 border border-neutral-800 focus:border-cyan-400 focus:outline-none text-xs text-white placeholder-neutral-500 resize-y"
+                  />
+                </div>
+
+                {/* Optional Name / Handle */}
+                <div>
+                  <label className="block text-[11px] font-semibold uppercase tracking-wider text-neutral-400 mb-1">
+                    Your Name or GitHub Handle <span className="text-neutral-500">(Optional)</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={suggestionSubmitter}
+                    onChange={(e) => setSuggestionSubmitter(e.target.value)}
+                    placeholder="e.g., @arussellturner"
+                    className="w-full px-3 py-2 rounded-xl bg-neutral-950 border border-neutral-800 focus:border-cyan-400 focus:outline-none text-xs text-white placeholder-neutral-500"
+                  />
+                </div>
+
+                {/* Include canvas diagnostic snapshot */}
+                <label className="flex items-center gap-2.5 p-2.5 rounded-xl bg-neutral-950/80 border border-neutral-800 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={includeSceneContext}
+                    onChange={(e) => setIncludeSceneContext(e.target.checked)}
+                    className="rounded accent-cyan-400"
+                  />
+                  <span className="text-xs text-neutral-300">
+                    Attach current shape snapshot ({blocks.length} blocks, {activeEscherCount}{' '}
+                    Escher welds) to the GitHub issue
+                  </span>
+                </label>
+
+                {suggestionError && (
+                  <div className="p-2.5 rounded-xl bg-rose-950/50 border border-rose-500/40 text-xs text-rose-300">
+                    {suggestionError}
+                  </div>
+                )}
+
+                <div className="pt-2 flex items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    disabled={isSubmittingSuggestion}
+                    onClick={() => setShowSuggestionModal(false)}
+                    className="px-3.5 py-2 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-xs font-medium transition"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={isSubmittingSuggestion}
+                    className="px-4 py-2 rounded-xl bg-cyan-400 hover:bg-cyan-300 disabled:opacity-50 text-neutral-950 text-xs font-bold flex items-center gap-1.5 shadow-lg shadow-cyan-500/20 transition"
+                  >
+                    {isSubmittingSuggestion ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        <span>Creating GitHub Issue...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Send className="w-3.5 h-3.5" />
+                        <span>Submit Suggestion</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* HOW IT WORKS MODAL */}
       {showHelpModal && (
@@ -1984,7 +2325,9 @@ export default function App() {
               <p>
                 <strong>3. Flip or Break the Illusion:</strong> Click any{' '}
                 <span className="text-amber-400 font-semibold">⚡ weld badge</span> on the canvas to
-                flip which beam passes in front or unmerge the joint. Drag the{' '}
+                flip which beam passes in front or unmerge the joint, or{' '}
+                <span className="text-cyan-300 font-semibold">Shift + Click</span> any block to
+                change which face plane welds. Drag the{' '}
                 <strong>Inspect 3D Depth Illusion</strong> slider at the bottom to tilt the camera
                 and see the secret 3D depth gap!
               </p>
