@@ -1,5 +1,7 @@
 import {
   AxisDirection,
+  BlockWeldOverride,
+  BlockWeldPlane,
   ConnectionMode,
   EscherConnection,
   FaceType,
@@ -198,7 +200,8 @@ export function buildEscherScene(
   blocks: VoxelBlock[],
   connectionModes: Record<string, ConnectionMode>,
   orientation: ViewOrientation,
-  scale: number = BASE_SCALE
+  scale: number = BASE_SCALE,
+  blockWeldOverrides: Record<string, BlockWeldOverride> = {}
 ): EngineSceneResult {
   const blockMap = new Map<string, VoxelBlock>();
   const blockLattice = new Map<string, LatticeCoord>();
@@ -583,9 +586,50 @@ export function buildEscherScene(
     }
   }
 
+  // Helper: find active weld plane override affecting a pair of competing blocks (including shared 1-hop corner block)
+  function findActiveWeldOverride(
+    id1: string,
+    id2: string
+  ): { ownerId: string; plane: BlockWeldPlane; order: number } | null {
+    const candidateIds: string[] = [id1, id2];
+    const edges1 = adjacencyGraph.get(id1) ?? [];
+    const edges2 = adjacencyGraph.get(id2) ?? [];
+    for (const e1 of edges1) {
+      if (edges2.some((e2) => e2.toId === e1.toId)) {
+        candidateIds.push(e1.toId);
+      }
+    }
+
+    let best: { ownerId: string; plane: BlockWeldPlane; order: number } | null = null;
+    for (const cid of candidateIds) {
+      const ov = blockWeldOverrides[cid];
+      if (ov && ov.plane !== 'auto') {
+        if (!best || ov.order > best.order) {
+          best = { ownerId: cid, plane: ov.plane, order: ov.order };
+        }
+      }
+    }
+    return best;
+  }
+
   // Comparator: returns true if claim2 is in front of claim1
   function isClaimInFront(claim1: TriangleClaim, claim2: TriangleClaim): boolean {
     if (claim1.blockId === claim2.blockId) return false;
+
+    // Check if the user toggled a specific block face/plane weld via Shift+Click
+    const ov = findActiveWeldOverride(claim1.blockId, claim2.blockId);
+    if (ov) {
+      if (ov.plane === 'X' || ov.plane === 'Y' || ov.plane === 'Z') {
+        if (claim2.faceType === ov.plane && claim1.faceType !== ov.plane) return true;
+        if (claim1.faceType === ov.plane && claim2.faceType !== ov.plane) return false;
+      } else if (ov.plane === 'front') {
+        if (claim2.blockId === ov.ownerId) return true;
+        if (claim1.blockId === ov.ownerId) return false;
+      } else if (ov.plane === 'back') {
+        if (claim2.blockId === ov.ownerId) return false;
+        if (claim1.blockId === ov.ownerId) return true;
+      }
+    }
 
     const rel = findLocalRelation(claim1.blockId, claim2.blockId);
     if (rel.found) {
@@ -647,6 +691,18 @@ export function buildEscherScene(
   // 5. Coplanarity check for merging edges between two adjacent triangles of the same faceType
   function shouldMergeSameFaceEdge(blockId1: string, blockId2: string, face: FaceType): boolean {
     if (blockId1 === blockId2) return true;
+
+    const ov = findActiveWeldOverride(blockId1, blockId2);
+    if (ov) {
+      const lc1 = blockLattice.get(blockId1)!;
+      const lc2 = blockLattice.get(blockId2)!;
+      if (Math.abs(lc1.u - lc2.u) <= 2 && Math.abs(lc1.v - lc2.v) <= 2) {
+        if (ov.plane === face || ov.plane === 'front' || ov.plane === 'back') {
+          return true;
+        }
+      }
+    }
+
     const rel = findLocalRelation(blockId1, blockId2);
     if (!rel.found) return false;
     if (face === 'X') return rel.dx === 0;
@@ -1020,4 +1076,73 @@ export function resolveGhostAtLattice(
     rhombuses,
   };
 }
+
+export const WELD_PLANE_LABELS: Record<BlockWeldPlane, string> = {
+  auto: 'Auto Weld',
+  X: 'X-Plane (Left/Gray Face)',
+  Y: 'Y-Plane (Bottom/Black Face)',
+  Z: 'Z-Plane (Top/White Face)',
+  front: 'All Faces Front',
+  back: 'All Faces Back',
+};
+
+/**
+ * Cycles through ['X', 'Y', 'Z', 'front', 'back', 'auto'] for `targetBlockId` and returns
+ * the next BlockWeldPlane that produces an immediately visible change in which block face welds.
+ */
+export function getNextDistinctWeldPlane(
+  targetBlockId: string,
+  blocks: VoxelBlock[],
+  connectionModes: Record<string, ConnectionMode>,
+  blockWeldOverrides: Record<string, BlockWeldOverride>,
+  orientation: ViewOrientation
+): { nextPlane: BlockWeldPlane; nextOrder: number } {
+  const cycle: BlockWeldPlane[] = ['X', 'Y', 'Z', 'front', 'back', 'auto'];
+  const currentPlane: BlockWeldPlane = blockWeldOverrides[targetBlockId]?.plane ?? 'auto';
+  const startIdx = cycle.indexOf(currentPlane);
+
+  let maxOrder = 0;
+  for (const ov of Object.values(blockWeldOverrides)) {
+    if (ov.order > maxOrder) maxOrder = ov.order;
+  }
+  const nextOrder = maxOrder + 1;
+
+  const faceSignature = (scene: EngineSceneResult) =>
+    scene.triangles
+      .map((t) => `${t.key}=${t.faceType}`)
+      .sort()
+      .join('|');
+
+  const currentScene = buildEscherScene(
+    blocks,
+    connectionModes,
+    orientation,
+    BASE_SCALE,
+    blockWeldOverrides
+  );
+  const currentSig = faceSignature(currentScene);
+
+  for (let offset = 1; offset <= cycle.length; offset++) {
+    const candidate = cycle[(startIdx + offset) % cycle.length];
+    const testOverrides: Record<string, BlockWeldOverride> = {
+      ...blockWeldOverrides,
+      [targetBlockId]: { plane: candidate, order: nextOrder },
+    };
+    const testScene = buildEscherScene(
+      blocks,
+      connectionModes,
+      orientation,
+      BASE_SCALE,
+      testOverrides
+    );
+    if (faceSignature(testScene) !== currentSig) {
+      return { nextPlane: candidate, nextOrder };
+    }
+  }
+
+  // Fallback if isolated block
+  const fallback = cycle[(startIdx + 1) % cycle.length];
+  return { nextPlane: fallback, nextOrder };
+}
+
 

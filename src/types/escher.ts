@@ -11,6 +11,13 @@ export type AxisDirection = '+X' | '-X' | '+Y' | '-Y' | '+Z' | '-Z';
 
 export type FaceType = 'X' | 'Y' | 'Z';
 
+export type BlockWeldPlane = 'auto' | 'X' | 'Y' | 'Z' | 'front' | 'back';
+
+export interface BlockWeldOverride {
+  plane: BlockWeldPlane;
+  order: number;
+}
+
 export type ConnectionMode = 'natural' | 'flipped' | 'disconnected';
 
 export interface EscherConnection {

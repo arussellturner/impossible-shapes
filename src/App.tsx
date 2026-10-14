@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AxisDirection,
+  BlockWeldOverride,
   ColorTheme,
   ConnectionMode,
   EscherConnection,
@@ -14,11 +15,13 @@ import {
   BASE_SCALE,
   GhostCandidate,
   ScreenPoint,
+  WELD_PLANE_LABELS,
   blockDepth,
   blockToLattice,
   buildEscherScene,
   findBestGhostCandidate,
   getBlockRhombuses,
+  getNextDistinctWeldPlane,
   latticeToScreen,
   resolveGhostAtLattice,
 } from './engine/isometricEngine';
@@ -52,6 +55,7 @@ import {
 interface HistorySnapshot {
   blocks: VoxelBlock[];
   connectionModes: Record<string, ConnectionMode>;
+  blockWeldOverrides: Record<string, BlockWeldOverride>;
 }
 
 function pointsToSvgPolygon(pts: ScreenPoint[]): string {
@@ -71,6 +75,7 @@ export default function App() {
     }))
   );
   const [connectionModes, setConnectionModes] = useState<Record<string, ConnectionMode>>({});
+  const [blockWeldOverrides, setBlockWeldOverrides] = useState<Record<string, BlockWeldOverride>>({});
   const [activePresetId, setActivePresetId] = useState<string>(initialPreset.id);
 
   // Undo / Redo history
@@ -95,6 +100,8 @@ export default function App() {
 
   // Selected / active block for keyboard or compass extrusion
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
+  const [isShiftHeld, setIsShiftHeld] = useState<boolean>(false);
+  const [lastWeldBanner, setLastWeldBanner] = useState<string | null>(null);
 
   // Keyboard Next-Block Cursor state (Arrow keys move next block, Spacebar adds block)
   const [inputMode, setInputMode] = useState<'mouse' | 'keyboard'>('keyboard');
@@ -158,44 +165,57 @@ export default function App() {
   const commitChange = useCallback(
     (
       nextBlocks: VoxelBlock[],
-      nextConnModes: Record<string, ConnectionMode> = connectionModes
+      nextConnModes: Record<string, ConnectionMode> = connectionModes,
+      nextWeldOverrides: Record<string, BlockWeldOverride> = blockWeldOverrides
     ) => {
-      setPast((prev) => [...prev.slice(-39), { blocks, connectionModes }]);
+      setPast((prev) => [
+        ...prev.slice(-39),
+        { blocks, connectionModes, blockWeldOverrides },
+      ]);
       setFuture([]);
       setBlocks(nextBlocks);
       setConnectionModes(nextConnModes);
+      setBlockWeldOverrides(nextWeldOverrides);
     },
-    [blocks, connectionModes]
+    [blocks, connectionModes, blockWeldOverrides]
   );
 
   const handleUndo = useCallback(() => {
     if (past.length === 0) return;
     const previous = past[past.length - 1];
     setPast((prev) => prev.slice(0, -1));
-    setFuture((prev) => [{ blocks, connectionModes }, ...prev]);
+    setFuture((prev) => [{ blocks, connectionModes, blockWeldOverrides }, ...prev]);
     setBlocks(previous.blocks);
     setConnectionModes(previous.connectionModes);
+    setBlockWeldOverrides(previous.blockWeldOverrides ?? {});
     const lastBlock = previous.blocks[previous.blocks.length - 1];
     setSelectedBlockId(lastBlock?.id ?? null);
     syncKbGhostFromBlock(lastBlock, lastBuildDir);
-  }, [past, blocks, connectionModes, lastBuildDir, syncKbGhostFromBlock]);
+  }, [past, blocks, connectionModes, blockWeldOverrides, lastBuildDir, syncKbGhostFromBlock]);
 
   const handleRedo = useCallback(() => {
     if (future.length === 0) return;
     const next = future[0];
     setFuture((prev) => prev.slice(1));
-    setPast((prev) => [...prev, { blocks, connectionModes }]);
+    setPast((prev) => [...prev, { blocks, connectionModes, blockWeldOverrides }]);
     setBlocks(next.blocks);
     setConnectionModes(next.connectionModes);
+    setBlockWeldOverrides(next.blockWeldOverrides ?? {});
     const lastBlock = next.blocks[next.blocks.length - 1];
     setSelectedBlockId(lastBlock?.id ?? null);
     syncKbGhostFromBlock(lastBlock, lastBuildDir);
-  }, [future, blocks, connectionModes, lastBuildDir, syncKbGhostFromBlock]);
+  }, [future, blocks, connectionModes, blockWeldOverrides, lastBuildDir, syncKbGhostFromBlock]);
 
   // Compute scene geometry & Escher connections
   const scene = useMemo(() => {
-    return buildEscherScene(blocks, connectionModes, orientation, BASE_SCALE);
-  }, [blocks, connectionModes, orientation]);
+    return buildEscherScene(
+      blocks,
+      connectionModes,
+      orientation,
+      BASE_SCALE,
+      blockWeldOverrides
+    );
+  }, [blocks, connectionModes, orientation, blockWeldOverrides]);
 
   // Center the view on the current structure
   const centerViewOnBlocks = useCallback(
@@ -249,7 +269,7 @@ export default function App() {
     setOrientation(nextOrientation);
     setActivePresetId(preset.id);
     setPeekAmount(0);
-    commitChange(newBlocks, preset.connectionOverrides ?? {});
+    commitChange(newBlocks, preset.connectionOverrides ?? {}, {});
     centerViewOnBlocks(newBlocks, nextOrientation);
     const last = newBlocks[newBlocks.length - 1];
     setSelectedBlockId(last?.id ?? null);
@@ -258,7 +278,7 @@ export default function App() {
 
   // Active Ghost Block Candidate (combines Keyboard arrow-key cursor and Mouse hover)
   const ghostCandidate: GhostCandidate | null = useMemo(() => {
-    if (toolMode !== 'build' || isPanning || Math.abs(peekAmount) > 0.01) {
+    if (toolMode !== 'build' || isPanning || isShiftHeld || Math.abs(peekAmount) > 0.01) {
       return null;
     }
 
@@ -297,6 +317,7 @@ export default function App() {
   }, [
     toolMode,
     isPanning,
+    isShiftHeld,
     peekAmount,
     inputMode,
     kbGhost,
@@ -331,7 +352,13 @@ export default function App() {
 
       // If autoConnect is disabled, mark newly created Escher connections as 'disconnected' by default
       if (!autoConnect) {
-        const previewScene = buildEscherScene(nextBlocks, nextModes, orientation, BASE_SCALE);
+        const previewScene = buildEscherScene(
+          nextBlocks,
+          nextModes,
+          orientation,
+          BASE_SCALE,
+          blockWeldOverrides
+        );
         for (const conn of previewScene.connections) {
           if (!(conn.id in nextModes)) {
             nextModes[conn.id] = 'disconnected';
@@ -339,7 +366,7 @@ export default function App() {
         }
       }
 
-      commitChange(nextBlocks, nextModes);
+      commitChange(nextBlocks, nextModes, blockWeldOverrides);
       setSelectedBlockId(newBlock.id);
       if (advanceDir) {
         setLastBuildDir(advanceDir);
@@ -356,7 +383,16 @@ export default function App() {
         movedSincePlace: false,
       });
     },
-    [blocks, connectionModes, autoConnect, orientation, lastBuildDir, commitChange, syncKbGhostFromBlock]
+    [
+      blocks,
+      connectionModes,
+      blockWeldOverrides,
+      autoConnect,
+      orientation,
+      lastBuildDir,
+      commitChange,
+      syncKbGhostFromBlock,
+    ]
   );
 
   // Move the "Next Block" ghost cursor using Arrow keys (or Q/E)
@@ -455,29 +491,80 @@ export default function App() {
   const removeBlockById = useCallback(
     (id: string) => {
       const nextBlocks = blocks.filter((b) => b.id !== id);
-      commitChange(nextBlocks, connectionModes);
+      const nextOverrides = { ...blockWeldOverrides };
+      delete nextOverrides[id];
+      commitChange(nextBlocks, connectionModes, nextOverrides);
       if (selectedBlockId === id) {
         const nextAnchor = nextBlocks.length > 0 ? nextBlocks[nextBlocks.length - 1] : undefined;
         setSelectedBlockId(nextAnchor?.id ?? null);
         syncKbGhostFromBlock(nextAnchor, lastBuildDir);
       }
     },
-    [blocks, connectionModes, selectedBlockId, lastBuildDir, commitChange, syncKbGhostFromBlock]
+    [
+      blocks,
+      connectionModes,
+      blockWeldOverrides,
+      selectedBlockId,
+      lastBuildDir,
+      commitChange,
+      syncKbGhostFromBlock,
+    ]
+  );
+
+  // Shift+Click (or 'W' key): Toggle which block face/plane visually welds at this block
+  const handleToggleBlockWeldPlane = useCallback(
+    (targetBlockId?: string) => {
+      const id =
+        targetBlockId ??
+        hoveredBlockId ??
+        selectedBlockId ??
+        blocks[blocks.length - 1]?.id;
+      if (!id) return;
+
+      const { nextPlane, nextOrder } = getNextDistinctWeldPlane(
+        id,
+        blocks,
+        connectionModes,
+        blockWeldOverrides,
+        orientation
+      );
+      const nextOverrides: Record<string, BlockWeldOverride> = {
+        ...blockWeldOverrides,
+        [id]: { plane: nextPlane, order: nextOrder },
+      };
+
+      commitChange(blocks, connectionModes, nextOverrides);
+      setSelectedBlockId(id);
+      setLastWeldBanner(`Weld Plane: ${WELD_PLANE_LABELS[nextPlane]}`);
+    },
+    [
+      hoveredBlockId,
+      selectedBlockId,
+      blocks,
+      connectionModes,
+      blockWeldOverrides,
+      orientation,
+      commitChange,
+    ]
   );
 
   // Cycle an Escher connection's mode: natural -> flipped -> disconnected -> natural
   const handleCycleConnection = useCallback(
     (conn: EscherConnection, e?: React.MouseEvent) => {
       if (e) e.stopPropagation();
+      if (e?.shiftKey) {
+        handleToggleBlockWeldPlane(conn.blockBId);
+        return;
+      }
       const order: ConnectionMode[] = ['natural', 'flipped', 'disconnected'];
       const nextMode = order[(order.indexOf(conn.mode) + 1) % order.length];
       const nextModes = {
         ...connectionModes,
         [conn.id]: nextMode,
       };
-      commitChange(blocks, nextModes);
+      commitChange(blocks, nextModes, blockWeldOverrides);
     },
-    [blocks, connectionModes, commitChange]
+    [blocks, connectionModes, blockWeldOverrides, commitChange, handleToggleBlockWeldPlane]
   );
 
   // Convert mouse event to SVG world coordinates
@@ -496,6 +583,9 @@ export default function App() {
   );
 
   const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    if (e.shiftKey !== isShiftHeld) {
+      setIsShiftHeld(e.shiftKey);
+    }
     if (isPanning && panStartRef.current) {
       const dx = (e.clientX - panStartRef.current.clientX) / zoom;
       const dy = (e.clientY - panStartRef.current.clientY) / zoom;
@@ -513,7 +603,7 @@ export default function App() {
     // Find closest block center if within hover radius
     if (world) {
       let closestId: string | null = null;
-      let minDistSq = (BASE_SCALE * 0.85) ** 2;
+      let minDistSq = (BASE_SCALE * 0.95) ** 2;
       for (const b of blocks) {
         const center = scene.blockScreenCenters.get(b.id);
         if (!center) continue;
@@ -528,8 +618,8 @@ export default function App() {
   };
 
   const handleMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
-    // Middle click or Shift+click panning
-    if (e.button === 1 || (e.button === 0 && e.shiftKey)) {
+    // Middle click panning (Shift+Click is reserved for toggling block face welds)
+    if (e.button === 1) {
       e.preventDefault();
       setIsPanning(true);
       panStartRef.current = {
@@ -549,10 +639,16 @@ export default function App() {
   };
 
   const handleCanvasClick = (e: React.MouseEvent<SVGSVGElement>) => {
-    if (isPanning || e.shiftKey) return;
+    if (isPanning) return;
     if (Math.abs(peekAmount) > 0.01) {
       // Snap back to isometric lock on click
       setPeekAmount(0);
+      return;
+    }
+
+    // Shift + Click toggles which block face/plane visually welds
+    if (e.shiftKey) {
+      handleToggleBlockWeldPlane(hoveredBlockId ?? selectedBlockId ?? undefined);
       return;
     }
 
@@ -605,9 +701,12 @@ export default function App() {
     }
   };
 
-  // Keyboard shortcuts: Arrow keys move the next block, Spacebar places the block!
+  // Keyboard shortcuts: Arrow keys move the next block, Spacebar places the block, Shift+Click / W toggles weld plane!
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Shift') {
+        setIsShiftHeld(true);
+      }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
         e.preventDefault();
         if (e.shiftKey) {
@@ -652,6 +751,11 @@ export default function App() {
         moveNextBlockCursor('+Y');
         return;
       }
+      if (e.key.toLowerCase() === 'w') {
+        e.preventDefault();
+        handleToggleBlockWeldPlane();
+        return;
+      }
 
       // Spacebar places the block at the current ghost position
       if (e.code === 'Space' || e.key === ' ') {
@@ -684,12 +788,25 @@ export default function App() {
         }
       }
     };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Shift') {
+        setIsShiftHeld(false);
+      }
+    };
+    const onWindowBlur = () => setIsShiftHeld(false);
     window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onWindowBlur);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onWindowBlur);
+    };
   }, [
     handleUndo,
     handleRedo,
     moveNextBlockCursor,
+    handleToggleBlockWeldPlane,
     peekAmount,
     ghostCandidate,
     addBlockAt,
@@ -952,7 +1069,7 @@ export default function App() {
                   {activeEscherCount} active Escher{' '}
                   {activeEscherCount === 1 ? 'weld' : 'welds'}
                 </span>
-                <span className="text-neutral-400">Click ⚡ badge to flip/unmerge</span>
+                <span className="text-neutral-400">⇧+Click block to change weld plane</span>
               </div>
             )}
           </div>
@@ -1014,6 +1131,33 @@ export default function App() {
                 Space
               </kbd>
             </button>
+
+            {/* Shift + Click Weld Plane Toggle Button */}
+            <div className="pt-2 border-t border-neutral-800/80 space-y-1.5">
+              <div className="flex items-center justify-between text-[11px]">
+                <span className="text-neutral-400">Block Face Weld:</span>
+                <span className="font-mono text-cyan-300 font-semibold">
+                  {WELD_PLANE_LABELS[
+                    blockWeldOverrides[
+                      hoveredBlockId ?? selectedBlockId ?? blocks[blocks.length - 1]?.id ?? ''
+                    ]?.plane ?? 'auto'
+                  ]}
+                </span>
+              </div>
+              <button
+                onClick={() => handleToggleBlockWeldPlane()}
+                className="w-full py-1.5 px-2.5 rounded-lg bg-neutral-900 hover:bg-neutral-800 border border-cyan-500/40 text-cyan-200 text-xs font-medium flex items-center justify-between transition"
+                title="Toggle which face/plane of the block visually welds (Shift+Click any block or press W)"
+              >
+                <span className="flex items-center gap-1.5">
+                  <FlipHorizontal2 className="w-3.5 h-3.5 text-cyan-400" />
+                  <span>Toggle Weld Plane</span>
+                </span>
+                <kbd className="px-1.5 py-0.5 text-[10px] font-mono bg-neutral-950 text-cyan-300 rounded border border-neutral-800">
+                  ⇧+Click / W
+                </kbd>
+              </button>
+            </div>
           </div>
 
           {/* Shape Presets Gallery */}
@@ -1075,7 +1219,7 @@ export default function App() {
             onClick={() => {
               const starter = { id: `b_${Date.now()}_0`, x: 0, y: 0, z: 0 };
               setActivePresetId('custom');
-              commitChange([starter], {});
+              commitChange([starter], {}, {});
               centerViewOnBlocks([starter]);
               setSelectedBlockId(starter.id);
               syncKbGhostFromBlock(starter, '+Y');
@@ -1089,7 +1233,7 @@ export default function App() {
           <button
             onClick={() => {
               setActivePresetId('empty');
-              commitChange([], {});
+              commitChange([], {}, {});
               setSelectedBlockId(null);
               syncKbGhostFromBlock(undefined);
             }}
@@ -1113,18 +1257,28 @@ export default function App() {
             </span>
             <span className="text-neutral-700">|</span>
             <span className="text-neutral-300">
-              {toolMode === 'build' &&
-                (ghostCandidate
-                  ? ghostCandidate.willEscherConnect
-                    ? '⚡ Press Space (or Click) to place & Escher-weld!'
-                    : `Arrow Keys: Move Next Block (${
-                        ghostCandidate.direction ?? 'grid'
-                      }) · Space: Add Block`
-                  : 'Arrow Keys: Move Next Block · Space: Add Block')}
-              {toolMode === 'erase' && 'Click any block to remove it'}
-              {toolMode === 'connect' &&
-                'Click any ⚡ connection node to flip weave order or disconnect'}
+              {isShiftHeld
+                ? '⇧ Shift+Click any block to toggle which block face/plane visually welds'
+                : toolMode === 'build'
+                  ? ghostCandidate
+                    ? ghostCandidate.willEscherConnect
+                      ? '⚡ Space (or Click): Escher-weld · ⇧+Click block: Toggle weld plane'
+                      : `Arrows: Move (${
+                          ghostCandidate.direction ?? 'grid'
+                        }) · Space: Add · ⇧+Click: Toggle Weld Plane`
+                    : 'Arrows: Move · Space: Add · ⇧+Click: Toggle Weld Plane'
+                  : toolMode === 'erase'
+                    ? 'Click any block to remove it'
+                    : 'Click ⚡ badge or ⇧+Click any block to toggle which face welds'}
             </span>
+            {lastWeldBanner && (
+              <>
+                <span className="text-neutral-700">|</span>
+                <span className="px-2 py-0.5 rounded-md bg-cyan-500/20 border border-cyan-500/40 text-cyan-300 font-mono text-[11px]">
+                  {lastWeldBanner}
+                </span>
+              </>
+            )}
           </div>
 
           {/* Right Export Buttons */}
@@ -1159,7 +1313,7 @@ export default function App() {
           className={`w-full h-full flex-1 transition-colors duration-200 ${
             isPanning
               ? 'cursor-grabbing'
-              : toolMode === 'erase'
+              : isShiftHeld || toolMode === 'erase'
                 ? 'cursor-pointer'
                 : 'cursor-crosshair'
           }`}
@@ -1203,14 +1357,29 @@ export default function App() {
                           : theme.faceZ;
                     const isHoveredErase =
                       toolMode === 'erase' && hoveredBlockId === tri.blockId;
+                    const isHoveredShiftWeld =
+                      isShiftHeld && hoveredBlockId === tri.blockId;
                     return (
                       <polygon
                         key={tri.key}
                         points={pointsToSvgPolygon(tri.points)}
                         fill={isHoveredErase ? '#f43f5e' : fill}
-                        stroke={isHoveredErase ? '#f43f5e' : fill}
-                        strokeWidth={0.65}
+                        stroke={
+                          isHoveredErase
+                            ? '#f43f5e'
+                            : isHoveredShiftWeld
+                              ? '#06b6d4'
+                              : fill
+                        }
+                        strokeWidth={isHoveredShiftWeld ? 1.8 : 0.65}
                         strokeLinejoin="round"
+                        onMouseEnter={() => setHoveredBlockId(tri.blockId)}
+                        onClick={(e) => {
+                          if (e.shiftKey) {
+                            e.stopPropagation();
+                            handleToggleBlockWeldPlane(tri.blockId);
+                          }
+                        }}
                       />
                     );
                   })}
@@ -1265,6 +1434,40 @@ export default function App() {
                     className="pointer-events-none opacity-75"
                   />
                 )}
+
+                {/* Shift-Hover Block Weld Plane Tooltip on Canvas */}
+                {isShiftHeld &&
+                  hoveredBlockId &&
+                  scene.blockScreenCenters.has(hoveredBlockId) && (
+                    <g
+                      transform={`translate(${
+                        scene.blockScreenCenters.get(hoveredBlockId)!.x
+                      }, ${scene.blockScreenCenters.get(hoveredBlockId)!.y - 30})`}
+                      className="pointer-events-none"
+                    >
+                      <rect
+                        x={-88}
+                        y={-12}
+                        width={176}
+                        height={22}
+                        rx={11}
+                        fill="#09090b"
+                        fillOpacity={0.92}
+                        stroke="#06b6d4"
+                        strokeWidth={1.5}
+                      />
+                      <text
+                        x={0}
+                        y={3}
+                        textAnchor="middle"
+                        fill="#67e8f9"
+                        fontSize={10}
+                        fontWeight="bold"
+                      >
+                        ⇧+Click: {WELD_PLANE_LABELS[blockWeldOverrides[hoveredBlockId]?.plane ?? 'auto']}
+                      </text>
+                    </g>
+                  )}
 
                 {/* Ghost Block Preview in Build Mode */}
                 {ghostCandidate && (
