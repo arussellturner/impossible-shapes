@@ -21,7 +21,8 @@ import {
   buildEscherScene,
   findBestGhostCandidate,
   getBlockRhombuses,
-  getNextDistinctWeldPlane,
+  findWeldJointForBlock,
+  getNextWeldJointToggle,
   latticeToScreen,
   resolveGhostAtLattice,
 } from './engine/isometricEngine';
@@ -238,6 +239,17 @@ export default function App() {
       blockWeldOverrides
     );
   }, [blocks, connectionModes, orientation, blockWeldOverrides]);
+
+  // The impossible weld joint that Shift+Click / W would currently toggle
+  const activeJoint = useMemo(
+    () =>
+      findWeldJointForBlock(
+        scene,
+        hoveredBlockId ?? selectedBlockId ?? blocks[blocks.length - 1]?.id,
+        hoveredBlockId ? cursorWorld : null
+      ),
+    [scene, hoveredBlockId, selectedBlockId, blocks, cursorWorld]
+  );
 
   // Center the view on the current structure
   const centerViewOnBlocks = useCallback(
@@ -533,9 +545,9 @@ export default function App() {
     ]
   );
 
-  // Shift+Click (or 'W' key): Toggle which block face/plane visually welds at this block
+  // Shift+Click (or 'W' key): Toggle which face/plane welds in front at the nearest impossible joint
   const handleToggleBlockWeldPlane = useCallback(
-    (targetBlockId?: string) => {
+    (targetBlockId?: string, point?: ScreenPoint | null) => {
       const id =
         targetBlockId ??
         hoveredBlockId ??
@@ -543,21 +555,26 @@ export default function App() {
         blocks[blocks.length - 1]?.id;
       if (!id) return;
 
-      const { nextPlane, nextOrder } = getNextDistinctWeldPlane(
+      const result = getNextWeldJointToggle(
         id,
         blocks,
         connectionModes,
         blockWeldOverrides,
-        orientation
+        orientation,
+        point ?? null
       );
+      setSelectedBlockId(id);
+      if (!result) {
+        setLastWeldBanner('No impossible joint here — Shift+Click where 3 blocks meet');
+        return;
+      }
       const nextOverrides: Record<string, BlockWeldOverride> = {
         ...blockWeldOverrides,
-        [id]: { plane: nextPlane, order: nextOrder },
+        [result.jointKey]: { plane: result.nextPlane, order: result.nextOrder },
       };
 
       commitChange(blocks, connectionModes, nextOverrides);
-      setSelectedBlockId(id);
-      setLastWeldBanner(`Weld Plane: ${WELD_PLANE_LABELS[nextPlane]}`);
+      setLastWeldBanner(`Joint: ${WELD_PLANE_LABELS[result.nextPlane]}`);
     },
     [
       hoveredBlockId,
@@ -670,7 +687,7 @@ export default function App() {
 
     // Shift + Click toggles which block face/plane visually welds
     if (e.shiftKey) {
-      handleToggleBlockWeldPlane(hoveredBlockId ?? selectedBlockId ?? undefined);
+      handleToggleBlockWeldPlane(hoveredBlockId ?? selectedBlockId ?? undefined, clientToWorld(e.clientX, e.clientY));
       return;
     }
 
@@ -1265,13 +1282,9 @@ export default function App() {
             {/* Shift + Click Weld Plane Toggle Button */}
             <div className="pt-2 border-t border-neutral-800/80 space-y-1.5">
               <div className="flex items-center justify-between text-[11px]">
-                <span className="text-neutral-400">Block Face Weld:</span>
+                <span className="text-neutral-400">Joint Weld:</span>
                 <span className="font-mono text-cyan-300 font-semibold">
-                  {WELD_PLANE_LABELS[
-                    blockWeldOverrides[
-                      hoveredBlockId ?? selectedBlockId ?? blocks[blocks.length - 1]?.id ?? ''
-                    ]?.plane ?? 'auto'
-                  ]}
+                  {activeJoint ? WELD_PLANE_LABELS[activeJoint.plane] : 'No joint nearby'}
                 </span>
               </div>
               <button
@@ -1515,7 +1528,7 @@ export default function App() {
                         onClick={(e) => {
                           if (e.shiftKey) {
                             e.stopPropagation();
-                            handleToggleBlockWeldPlane(tri.blockId);
+                            handleToggleBlockWeldPlane(tri.blockId, clientToWorld(e.clientX, e.clientY));
                           }
                         }}
                       />
@@ -1573,20 +1586,22 @@ export default function App() {
                   />
                 )}
 
-                {/* Shift-Hover Block Weld Plane Tooltip on Canvas */}
-                {isShiftHeld &&
-                  hoveredBlockId &&
-                  scene.blockScreenCenters.has(hoveredBlockId) && (
-                    <g
-                      transform={`translate(${
-                        scene.blockScreenCenters.get(hoveredBlockId)!.x
-                      }, ${scene.blockScreenCenters.get(hoveredBlockId)!.y - 30})`}
-                      className="pointer-events-none"
-                    >
+                {/* Shift-Hover: highlight the impossible joint that Shift+Click will toggle */}
+                {isShiftHeld && hoveredBlockId && (
+                  <g
+                    transform={`translate(${
+                      (activeJoint?.center ?? scene.blockScreenCenters.get(hoveredBlockId))?.x ?? 0
+                    }, ${(activeJoint?.center ?? scene.blockScreenCenters.get(hoveredBlockId))?.y ?? 0})`}
+                    className="pointer-events-none"
+                  >
+                    {activeJoint && (
+                      <circle r={9} fill="none" stroke="#06b6d4" strokeWidth={2.5} strokeDasharray="3 2" />
+                    )}
+                    <g transform="translate(0, -30)">
                       <rect
-                        x={-88}
+                        x={-104}
                         y={-12}
-                        width={176}
+                        width={208}
                         height={22}
                         rx={11}
                         fill="#09090b"
@@ -1602,10 +1617,13 @@ export default function App() {
                         fontSize={10}
                         fontWeight="bold"
                       >
-                        ⇧+Click: {WELD_PLANE_LABELS[blockWeldOverrides[hoveredBlockId]?.plane ?? 'auto']}
+                        {activeJoint
+                          ? `⇧+Click: ${WELD_PLANE_LABELS[activeJoint.plane]}`
+                          : 'No impossible joint here'}
                       </text>
                     </g>
-                  )}
+                  </g>
+                )}
 
                 {/* Ghost Block Preview in Build Mode */}
                 {ghostCandidate && (

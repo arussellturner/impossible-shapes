@@ -59,12 +59,26 @@ export interface GhostCandidate {
   };
 }
 
+/**
+ * A 3-block weld joint: three mutually linked blocks around one unit lattice triangle.
+ * `plane` is the face (X gray / Y black / Z white) that welds in front at this joint.
+ */
+export interface WeldJoint {
+  key: string;
+  blockIds: [string, string, string];
+  plane: PositiveAxis;
+  defaultPlane: PositiveAxis;
+  validPlanes: PositiveAxis[];
+  center: ScreenPoint;
+}
+
 export interface EngineSceneResult {
   triangles: RenderedTriangle[];
   edges: RenderedEdge[];
   seamEdges: RenderedEdge[];
   connections: EscherConnection[];
   blockScreenCenters: Map<string, ScreenPoint>;
+  weldJoints: WeldJoint[];
 }
 
 /**
@@ -311,11 +325,15 @@ export function buildEscherScene(
   }
 
   // Filter out 2-hop real 3D corners (where normA and normB share a common real 3D neighbor)
+  const cornerIds = new Set<string>();
+  const candidateById = new Map<string, RawEscherCandidate>();
+  for (const cand of rawCandidates) candidateById.set(cand.connId, cand);
   const nonCornerCandidates = rawCandidates.filter((cand) => {
     const nA = realNeighbors.get(cand.normA.id)!;
     const nB = realNeighbors.get(cand.normB.id)!;
     for (const midId of nA) {
       if (nB.has(midId)) {
+        cornerIds.add(cand.connId);
         return false; // Real 3D 90-degree corner diagonal (kGap = +-1)
       }
     }
@@ -432,19 +450,173 @@ export function buildEscherScene(
     }
   }
 
+  // 1b. Real-corner diagonals and discarded hypotenuse candidates are also visual links; they only
+  // ever live inside a 3-block weld joint (triad) and are broken by default there (real 3D look).
+  for (const cand of rawCandidates) {
+    if (!cornerIds.has(cand.connId) && !discardedIds.has(cand.connId)) continue;
+    if ((connectionModes[cand.connId] ?? 'natural') === 'disconnected') continue;
+    const posInfo = AXIS_DELTAS[cand.posDir];
+    adjacencyGraph.get(cand.normA.id)!.push({
+      toId: cand.normB.id,
+      dx: posInfo.dx,
+      dy: posInfo.dy,
+      dz: posInfo.dz,
+      depthDelta: 1,
+      isEscher: true,
+    });
+    adjacencyGraph.get(cand.normB.id)!.push({
+      toId: cand.normA.id,
+      dx: -posInfo.dx,
+      dy: -posInfo.dy,
+      dz: -posInfo.dz,
+      depthDelta: -1,
+      isEscher: true,
+    });
+  }
+
+  // 1c. Weld joints: three blocks whose lattice cells surround one unit triangle and are all linked.
+  // Their +X/+Y/+Z links form a cycle (sum = (1,1,1) != 0), which is the impossible part.
+  // Exactly one link must be "broken" for a consistent local depth order. Breaking the link
+  // leaving the W-claimant along +W exposes that block's whole W face (plane W welds in front).
+  const cellBlock = new Map<string, string>();
+  for (const b of blocks) {
+    const lc = blockLattice.get(b.id)!;
+    const k = `${lc.u},${lc.v}`;
+    if (!cellBlock.has(k)) cellBlock.set(k, b.id);
+  }
+  const hasEdge = (a: string, b: string) =>
+    (adjacencyGraph.get(a) ?? []).some((e) => e.toId === b);
+
+  const PLANES: PositiveAxis[] = ['X', 'Y', 'Z'];
+  const weldJoints: WeldJoint[] = [];
+  const brokenPairs = new Set<string>();
+
+  const edgeBreakScore = (from: string, to: string): number => {
+    const connId = makeConnectionId(from, to);
+    if (cornerIds.has(connId)) return 4;
+    if (discardedIds.has(connId)) return 3;
+    if (realNeighbors.get(from)?.has(to)) return 0;
+    const cand = candidateById.get(connId);
+    return 1 + Math.min(Math.abs(cand?.kGap ?? 0), 50) / 100;
+  };
+
+  // A link P -> +D -> Q is an internal beam spine if P continues the same beam backwards (-D).
+  // Breaking it would expose P's buried cross-section cap in the middle of a straight bar.
+  const isSpine = (from: string, plane: PositiveAxis): boolean => {
+    const lc = blockLattice.get(from)!;
+    const d = AXIS_DELTAS[`-${plane}` as AxisDirection];
+    const backId = cellBlock.get(`${lc.u + d.du},${lc.v + d.dv}`);
+    return !!backId && hasEdge(from, backId);
+  };
+
+  const tryJoint = (
+    key: string,
+    kind: 'A' | 'B',
+    cu: number,
+    cv: number,
+    cells: Record<PositiveAxis, [number, number]>,
+    links: Record<PositiveAxis, [PositiveAxis, PositiveAxis]>
+  ) => {
+    const ids = {} as Record<PositiveAxis, string>;
+    for (const p of PLANES) {
+      const id = cellBlock.get(`${cells[p][0]},${cells[p][1]}`);
+      if (!id) return;
+      ids[p] = id;
+    }
+    const edges = {} as Record<PositiveAxis, { from: string; to: string }>;
+    for (const p of PLANES) {
+      const [f, t] = links[p];
+      const from = ids[f];
+      const to = ids[t];
+      if (!hasEdge(from, to)) return;
+      edges[p] = { from, to };
+    }
+
+    let defaultPlane: PositiveAxis = 'Y';
+    let bestScore = -Infinity;
+    for (const p of PLANES) {
+      const s = edgeBreakScore(edges[p].from, edges[p].to);
+      if (s > bestScore) {
+        bestScore = s;
+        defaultPlane = p;
+      }
+    }
+    let validPlanes = PLANES.filter((p) => !isSpine(edges[p].from, p));
+    if (validPlanes.length === 0) validPlanes = [...PLANES];
+    if (!validPlanes.includes(defaultPlane)) validPlanes = PLANES.filter((p) => p === defaultPlane || validPlanes.includes(p));
+
+    const ov = blockWeldOverrides[`joint:${key}`];
+    const plane: PositiveAxis =
+      ov && (ov.plane === 'X' || ov.plane === 'Y' || ov.plane === 'Z') && validPlanes.includes(ov.plane)
+        ? ov.plane
+        : defaultPlane;
+
+    brokenPairs.add(makeConnectionId(edges[plane].from, edges[plane].to));
+
+    const p1 = latticeToScreen(cu, cv, orientation, scale);
+    const p2 = latticeToScreen(cu + 1, kind === 'A' ? cv : cv + 1, orientation, scale);
+    const p3 = latticeToScreen(kind === 'A' ? cu + 1 : cu, cv + 1, orientation, scale);
+    weldJoints.push({
+      key,
+      blockIds: [ids.X, ids.Y, ids.Z],
+      plane,
+      defaultPlane,
+      validPlanes,
+      center: { x: (p1.x + p2.x + p3.x) / 3, y: (p1.y + p2.y + p3.y) / 3 },
+    });
+  };
+
+  for (const b of blocks) {
+    const { u, v } = blockLattice.get(b.id)!;
+    if (cellBlock.get(`${u},${v}`) !== b.id) continue;
+    // ΔA(u,v): X-claimant (u+1,v), Y-claimant (u,v), Z-claimant (u+1,v+1)
+    tryJoint(
+      `A:${u},${v}`,
+      'A',
+      u,
+      v,
+      { X: [u + 1, v], Y: [u, v], Z: [u + 1, v + 1] },
+      { X: ['X', 'Y'], Y: ['Y', 'Z'], Z: ['Z', 'X'] }
+    );
+    // ΔB(u,v): X-claimant (u+1,v+1), Y-claimant (u,v), Z-claimant (u,v+1)
+    tryJoint(
+      `B:${u},${v}`,
+      'B',
+      u,
+      v,
+      { X: [u + 1, v + 1], Y: [u, v], Z: [u, v + 1] },
+      { X: ['X', 'Z'], Y: ['Y', 'X'], Z: ['Z', 'Y'] }
+    );
+  }
+
+  for (const [id, edges] of adjacencyGraph.entries()) {
+    adjacencyGraph.set(
+      id,
+      edges.filter((e) => !brokenPairs.has(makeConnectionId(id, e.toId)))
+    );
+  }
+
   // 2. Helper: Find local virtual 3D offset & relative depth between two nearby blocks via BFS (<= 4 hops)
   const MAX_LOCAL_HOPS = 4;
-  function findLocalRelation(
-    startId: string,
-    targetId: string
-  ): {
+  type LocalRelation = {
     found: boolean;
     dx: number;
     dy: number;
     dz: number;
     depthDelta: number;
     hasEscher: boolean;
-  } {
+  };
+  const relationCache = new Map<string, LocalRelation>();
+  function findLocalRelation(startId: string, targetId: string): LocalRelation {
+    const ck = `${startId}|${targetId}`;
+    let rel = relationCache.get(ck);
+    if (!rel) {
+      rel = computeLocalRelation(startId, targetId);
+      relationCache.set(ck, rel);
+    }
+    return rel;
+  }
+  function computeLocalRelation(startId: string, targetId: string): LocalRelation {
     if (startId === targetId) {
       return { found: true, dx: 0, dy: 0, dz: 0, depthDelta: 0, hasEscher: false };
     }
@@ -586,80 +758,56 @@ export function buildEscherScene(
     }
   }
 
-  // Helper: find active weld plane override affecting a pair of competing blocks (including shared 1-hop corner block)
-  function findActiveWeldOverride(
-    id1: string,
-    id2: string
-  ): { ownerId: string; plane: BlockWeldPlane; order: number } | null {
-    const candidateIds: string[] = [id1, id2];
-    const edges1 = adjacencyGraph.get(id1) ?? [];
-    const edges2 = adjacencyGraph.get(id2) ?? [];
-    for (const e1 of edges1) {
-      if (edges2.some((e2) => e2.toId === e1.toId)) {
-        candidateIds.push(e1.toId);
-      }
-    }
+  // Comparator: returns true if block2 is in front of block1.
+  // Depends ONLY on the two blocks (never on which face is competing), so a block either wins
+  // or loses against a neighbor consistently across every triangle they share.
+  function isBlockInFront(id1: string, id2: string): boolean {
+    if (id1 === id2) return false;
 
-    let best: { ownerId: string; plane: BlockWeldPlane; order: number } | null = null;
-    for (const cid of candidateIds) {
-      const ov = blockWeldOverrides[cid];
-      if (ov && ov.plane !== 'auto') {
-        if (!best || ov.order > best.order) {
-          best = { ownerId: cid, plane: ov.plane, order: ov.order };
-        }
-      }
-    }
-    return best;
-  }
-
-  // Comparator: returns true if claim2 is in front of claim1
-  function isClaimInFront(claim1: TriangleClaim, claim2: TriangleClaim): boolean {
-    if (claim1.blockId === claim2.blockId) return false;
-
-    // Check if the user toggled a specific block face/plane weld via Shift+Click
-    const ov = findActiveWeldOverride(claim1.blockId, claim2.blockId);
-    if (ov) {
-      if (ov.plane === 'X' || ov.plane === 'Y' || ov.plane === 'Z') {
-        if (claim2.faceType === ov.plane && claim1.faceType !== ov.plane) return true;
-        if (claim1.faceType === ov.plane && claim2.faceType !== ov.plane) return false;
-      } else if (ov.plane === 'front') {
-        if (claim2.blockId === ov.ownerId) return true;
-        if (claim1.blockId === ov.ownerId) return false;
-      } else if (ov.plane === 'back') {
-        if (claim2.blockId === ov.ownerId) return false;
-        if (claim1.blockId === ov.ownerId) return true;
-      }
-    }
-
-    const rel = findLocalRelation(claim1.blockId, claim2.blockId);
+    const rel = findLocalRelation(id1, id2);
     if (rel.found) {
       if (rel.depthDelta !== 0) {
         return rel.depthDelta > 0;
       }
     }
 
-    const b1 = blockMap.get(claim1.blockId)!;
-    const b2 = blockMap.get(claim2.blockId)!;
+    const b1 = blockMap.get(id1)!;
+    const b2 = blockMap.get(id2)!;
     const d1 = blockDepth(b1.x, b1.y, b1.z);
     const d2 = blockDepth(b2.x, b2.y, b2.z);
 
-    const connId = makeConnectionId(claim1.blockId, claim2.blockId);
+    const connId = makeConnectionId(id1, id2);
     const crossMode = connectionModes[connId];
     if (crossMode === 'flipped') {
       return d2 < d1;
     }
 
-    return d2 > d1;
+    if (d2 !== d1) return d2 > d1;
+    return id2 > id1;
+  }
+
+  // A face D of block P is buried (glued) when P is linked to a neighbor Q one step along +D
+  // that sits directly in front of it: that face is an internal cross-section and never visible.
+  function isClaimBuried(claim: TriangleClaim, claims: TriangleClaim[]): boolean {
+    const d = AXIS_DELTAS[`+${claim.faceType}` as AxisDirection];
+    for (const e of adjacencyGraph.get(claim.blockId) ?? []) {
+      if (e.dx === d.dx && e.dy === d.dy && e.dz === d.dz && e.depthDelta > 0) {
+        if (claims.some((c) => c.blockId === e.toId)) return true;
+      }
+    }
+    return false;
   }
 
   // 4. Resolve the winning block and faceType for each occupied 2D unit triangle
   const winningClaims = new Map<string, TriangleClaim>();
   const renderedTriangles: RenderedTriangle[] = [];
 
-  for (const [key, claims] of triangleClaims.entries()) {
+  for (const [key, allClaims] of triangleClaims.entries()) {
+    const visible = allClaims.filter((c) => !isClaimBuried(c, allClaims));
+    const claims = visible.length > 0 ? visible : allClaims;
     let winner = claims[0];
     for (let i = 1; i < claims.length; i++) {
-      if (isClaimInFront(winner, claims[i])) {
+      if (isBlockInFront(winner.blockId, claims[i].blockId)) {
         winner = claims[i];
       }
     }
@@ -691,17 +839,6 @@ export function buildEscherScene(
   // 5. Coplanarity check for merging edges between two adjacent triangles of the same faceType
   function shouldMergeSameFaceEdge(blockId1: string, blockId2: string, face: FaceType): boolean {
     if (blockId1 === blockId2) return true;
-
-    const ov = findActiveWeldOverride(blockId1, blockId2);
-    if (ov) {
-      const lc1 = blockLattice.get(blockId1)!;
-      const lc2 = blockLattice.get(blockId2)!;
-      if (Math.abs(lc1.u - lc2.u) <= 2 && Math.abs(lc1.v - lc2.v) <= 2) {
-        if (ov.plane === face || ov.plane === 'front' || ov.plane === 'back') {
-          return true;
-        }
-      }
-    }
 
     const rel = findLocalRelation(blockId1, blockId2);
     if (!rel.found) return false;
@@ -859,6 +996,7 @@ export function buildEscherScene(
     })),
     connections: escherConnections,
     blockScreenCenters,
+    weldJoints,
   };
 }
 
@@ -1079,70 +1217,77 @@ export function resolveGhostAtLattice(
 
 export const WELD_PLANE_LABELS: Record<BlockWeldPlane, string> = {
   auto: 'Auto Weld',
-  X: 'X-Plane (Left/Gray Face)',
-  Y: 'Y-Plane (Bottom/Black Face)',
-  Z: 'Z-Plane (Top/White Face)',
+  X: 'Gray (X) face welds in front',
+  Y: 'Black (Y) face welds in front',
+  Z: 'White (Z) face welds in front',
   front: 'All Faces Front',
   back: 'All Faces Back',
 };
 
 /**
- * Cycles through ['X', 'Y', 'Z', 'front', 'back', 'auto'] for `targetBlockId` and returns
- * the next BlockWeldPlane that produces an immediately visible change in which block face welds.
+ * Finds the weld joint (3-block impossible corner) that Shift+Click on `blockId` should act on.
+ * Prefers joints containing the block, nearest to `point` (screen/world coords) if given.
  */
-export function getNextDistinctWeldPlane(
+export function findWeldJointForBlock(
+  scene: EngineSceneResult,
+  blockId: string | null | undefined,
+  point?: ScreenPoint | null
+): WeldJoint | null {
+  const ref = point ?? (blockId ? scene.blockScreenCenters.get(blockId) : undefined) ?? null;
+  const dist = (j: WeldJoint) => (ref ? (j.center.x - ref.x) ** 2 + (j.center.y - ref.y) ** 2 : 0);
+
+  const owned = blockId ? scene.weldJoints.filter((j) => j.blockIds.includes(blockId)) : [];
+  if (owned.length > 0) {
+    return owned.reduce((best, j) => (dist(j) < dist(best) ? j : best));
+  }
+  if (!ref || scene.weldJoints.length === 0) return null;
+  const nearest = scene.weldJoints.reduce((best, j) => (dist(j) < dist(best) ? j : best));
+  return dist(nearest) <= (BASE_SCALE * 1.2) ** 2 ? nearest : null;
+}
+
+/**
+ * Shift+Click: cycles the nearest weld joint to the next coherent plane (X -> Y -> Z) that
+ * produces a visible change. Only geometrically consistent options are offered: each option
+ * breaks exactly one link of the joint's impossible cycle, so every face stays whole.
+ */
+export function getNextWeldJointToggle(
   targetBlockId: string,
   blocks: VoxelBlock[],
   connectionModes: Record<string, ConnectionMode>,
   blockWeldOverrides: Record<string, BlockWeldOverride>,
-  orientation: ViewOrientation
-): { nextPlane: BlockWeldPlane; nextOrder: number } {
-  const cycle: BlockWeldPlane[] = ['X', 'Y', 'Z', 'front', 'back', 'auto'];
-  const currentPlane: BlockWeldPlane = blockWeldOverrides[targetBlockId]?.plane ?? 'auto';
-  const startIdx = cycle.indexOf(currentPlane);
+  orientation: ViewOrientation,
+  point?: ScreenPoint | null
+): { jointKey: string; nextPlane: PositiveAxis; nextOrder: number } | null {
+  const scene = buildEscherScene(blocks, connectionModes, orientation, BASE_SCALE, blockWeldOverrides);
+  const joint = findWeldJointForBlock(scene, targetBlockId, point);
+  if (!joint || joint.validPlanes.length < 2) return null;
 
   let maxOrder = 0;
   for (const ov of Object.values(blockWeldOverrides)) {
     if (ov.order > maxOrder) maxOrder = ov.order;
   }
   const nextOrder = maxOrder + 1;
+  const jointKey = `joint:${joint.key}`;
 
-  const faceSignature = (scene: EngineSceneResult) =>
-    scene.triangles
+  const signature = (s: EngineSceneResult) =>
+    s.triangles
       .map((t) => `${t.key}=${t.faceType}`)
       .sort()
       .join('|');
+  const currentSig = signature(scene);
 
-  const currentScene = buildEscherScene(
-    blocks,
-    connectionModes,
-    orientation,
-    BASE_SCALE,
-    blockWeldOverrides
-  );
-  const currentSig = faceSignature(currentScene);
-
-  for (let offset = 1; offset <= cycle.length; offset++) {
-    const candidate = cycle[(startIdx + offset) % cycle.length];
-    const testOverrides: Record<string, BlockWeldOverride> = {
+  const order: PositiveAxis[] = ['X', 'Y', 'Z'];
+  const start = order.indexOf(joint.plane);
+  for (let offset = 1; offset < order.length; offset++) {
+    const candidate = order[(start + offset) % order.length];
+    if (!joint.validPlanes.includes(candidate)) continue;
+    const test = buildEscherScene(blocks, connectionModes, orientation, BASE_SCALE, {
       ...blockWeldOverrides,
-      [targetBlockId]: { plane: candidate, order: nextOrder },
-    };
-    const testScene = buildEscherScene(
-      blocks,
-      connectionModes,
-      orientation,
-      BASE_SCALE,
-      testOverrides
-    );
-    if (faceSignature(testScene) !== currentSig) {
-      return { nextPlane: candidate, nextOrder };
+      [jointKey]: { plane: candidate, order: nextOrder },
+    });
+    if (signature(test) !== currentSig) {
+      return { jointKey, nextPlane: candidate, nextOrder };
     }
   }
-
-  // Fallback if isolated block
-  const fallback = cycle[(startIdx + 1) % cycle.length];
-  return { nextPlane: fallback, nextOrder };
+  return null;
 }
-
-
