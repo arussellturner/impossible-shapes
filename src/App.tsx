@@ -1056,7 +1056,7 @@ export default function App() {
         }
       }
 
-      // Fallback for static hosting without backend middleware: open pre-filled GitHub issue
+      // Fallback for static hosting (GitHub Pages): open pre-filled GitHub Issue and display direct link
       const issueTitle = title.startsWith('[Suggestion]') ? title : `[Suggestion] ${title}`;
       const bodyLines = [
         `### Suggestion Summary`,
@@ -1081,7 +1081,13 @@ export default function App() {
         suggestionCategory === 'bug' ? 'bug' : 'enhancement'
       )}`;
       window.open(fallbackUrl, '_blank', 'noopener,noreferrer');
-      setShowSuggestionModal(false);
+      setCreatedIssue({
+        number: 0,
+        html_url: fallbackUrl,
+        title: issueTitle,
+      });
+      setSuggestionTitle('');
+      setSuggestionDescription('');
     } catch (err) {
       setSuggestionError(
         err instanceof Error ? err.message : 'Could not submit suggestion to GitHub.'
@@ -2118,11 +2124,25 @@ export default function App() {
               <div className="p-4 rounded-xl bg-emerald-950/40 border border-emerald-500/40 space-y-3">
                 <div className="flex items-center gap-2 text-emerald-300 font-semibold text-sm">
                   <CheckCircle2 className="w-5 h-5 text-emerald-400 flex-shrink-0" />
-                  <span>Suggestion saved as GitHub Issue #{createdIssue.number}!</span>
+                  <span>
+                    {createdIssue.number > 0
+                      ? `Suggestion saved as GitHub Issue #${createdIssue.number}!`
+                      : 'GitHub Issue Ready to Submit!'}
+                  </span>
                 </div>
                 <p className="text-xs text-neutral-300 leading-relaxed">
-                  Thank you! Your suggestion (<strong>{createdIssue.title}</strong>) has been
-                  created in the repository issue tracker.
+                  {createdIssue.number > 0 ? (
+                    <>
+                      Thank you! Your suggestion (<strong>{createdIssue.title}</strong>) has been
+                      created in the repository issue tracker.
+                    </>
+                  ) : (
+                    <>
+                      Your suggestion (<strong>{createdIssue.title}</strong>) has been pre-filled
+                      for the GitHub issue tracker. Click below if the GitHub tab did not open
+                      automatically.
+                    </>
+                  )}
                 </p>
                 <div className="pt-1 flex items-center justify-between gap-2">
                   <a
@@ -2131,7 +2151,11 @@ export default function App() {
                     rel="noopener noreferrer"
                     className="px-3.5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-neutral-950 text-xs font-bold inline-flex items-center gap-1.5 transition"
                   >
-                    <span>View Issue #{createdIssue.number} on GitHub</span>
+                    <span>
+                      {createdIssue.number > 0
+                        ? `View Issue #${createdIssue.number} on GitHub`
+                        : 'Open & Save Issue on GitHub'}
+                    </span>
                     <ExternalLink className="w-3.5 h-3.5" />
                   </a>
                   <div className="flex items-center gap-2">

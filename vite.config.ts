@@ -28,7 +28,7 @@ function attachSuggestionEndpoint(
     ) => void;
   }
 ) {
-  middlewares.use('/api/suggestions', (req, res, next) => {
+  const handler = (req: IncomingMessage, res: ServerResponse, next: () => void) => {
     if (req.method !== 'POST') {
       next();
       return;
@@ -172,7 +172,9 @@ function attachSuggestionEndpoint(
         );
       }
     });
-  });
+  };
+  middlewares.use('/api/suggestions', handler);
+  middlewares.use('/impossible-shapes/api/suggestions', handler);
 }
 
 function githubSuggestionPlugin(): Plugin {
@@ -188,5 +190,6 @@ function githubSuggestionPlugin(): Plugin {
 }
 
 export default defineConfig({
+  base: '/impossible-shapes/',
   plugins: [react(), githubSuggestionPlugin()],
 });
