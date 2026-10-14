@@ -56,6 +56,10 @@ import {
   Zap,
   ZoomIn,
   ZoomOut,
+  Menu,
+  X,
+  Settings,
+  ArrowUp,
 } from 'lucide-react';
 
 interface HistorySnapshot {
@@ -66,6 +70,39 @@ interface HistorySnapshot {
 
 function pointsToSvgPolygon(pts: ScreenPoint[]): string {
   return pts.map((p) => `${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(' ');
+}
+
+function ToggleRow({
+  label,
+  description,
+  value,
+  onChange,
+}: {
+  label: string;
+  description?: string;
+  value: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <button
+      onClick={() => onChange(!value)}
+      className="w-full px-3 py-3 rounded-xl bg-neutral-950/60 border border-neutral-800 hover:bg-neutral-950 flex items-center justify-between gap-3 text-left transition"
+      role="switch"
+      aria-checked={value}
+    >
+      <span>
+        <span className="block text-sm text-neutral-200">{label}</span>
+        {description && <span className="block text-[11px] text-neutral-500">{description}</span>}
+      </span>
+      <span
+        className={`w-10 h-6 flex-shrink-0 flex items-center rounded-full p-0.5 transition ${
+          value ? 'bg-amber-500 justify-end' : 'bg-neutral-700 justify-start'
+        }`}
+      >
+        <span className="w-5 h-5 rounded-full bg-white shadow" />
+      </span>
+    </button>
+  );
 }
 
 export default function App() {
@@ -96,13 +133,51 @@ export default function App() {
   const [theme, setTheme] = useState<ColorTheme>(COLOR_THEMES[0]);
   const [showGrid, setShowGrid] = useState<boolean>(true);
   const [showVoxelSeams, setShowVoxelSeams] = useState<boolean>(false);
-  const [showConnectionBadges, setShowConnectionBadges] = useState<boolean>(true);
+  const [showConnectionBadges, setShowConnectionBadges] = useState<boolean>(false);
   const [strokeWidth, setStrokeWidth] = useState<number>(2.4);
   const [autoConnect, setAutoConnect] = useState<boolean>(true);
 
-  // 3D Illusion Peek state (0 = locked isometric sweet spot, != 0 = tilted 3D reveal)
-  const [peekAmount, setPeekAmount] = useState<number>(0);
   const [showHelpModal, setShowHelpModal] = useState<boolean>(false);
+
+  // Hamburger menu (Settings / Starters / Export)
+  const [menuOpen, setMenuOpen] = useState<boolean>(
+    () => typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('openmenu')
+  );
+  const [menuSection, setMenuSection] = useState<'settings' | 'starters' | 'export'>('starters');
+
+  // Touch device detection (shows the on-screen D-pad)
+  const [isTouch, setIsTouch] = useState<boolean>(
+    () =>
+      typeof window !== 'undefined' &&
+      (window.matchMedia('(pointer: coarse)').matches ||
+        new URLSearchParams(window.location.search).has('touch'))
+  );
+  useEffect(() => {
+    const mq = window.matchMedia('(pointer: coarse)');
+    const forced = new URLSearchParams(window.location.search).has('touch');
+    const onChange = () => setIsTouch(forced || mq.matches);
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
+
+  // Canvas size (used to center the drawing in the SVG)
+  const [viewSize, setViewSize] = useState<{ w: number; h: number }>(() => ({
+    w: typeof window !== 'undefined' ? window.innerWidth : 800,
+    h: typeof window !== 'undefined' ? window.innerHeight : 600,
+  }));
+
+  // Touch gestures: one-finger pan, two-finger pinch zoom
+  const touchRef = useRef<{
+    mode: 'pan' | 'pinch';
+    startX: number;
+    startY: number;
+    panX: number;
+    panY: number;
+    dist: number;
+    zoom: number;
+    moved: boolean;
+  } | null>(null);
+  const suppressClickRef = useRef<boolean>(false);
 
   // Suggestion / GitHub Issue Modal state
   const [showSuggestionModal, setShowSuggestionModal] = useState<boolean>(false);
@@ -272,12 +347,27 @@ export default function App() {
         if (pt.y > maxY) maxY = pt.y;
       }
 
+      // Fit the shape into the free area between the top and bottom control bars
+      const vw = svgRef.current?.clientWidth || window.innerWidth;
+      const vh = svgRef.current?.clientHeight || window.innerHeight;
+      const landscapeTouch = isTouch && vw > vh;
+      const topReserve = 70;
+      const bottomReserve = isTouch && !landscapeTouch ? 220 : landscapeTouch ? 16 : 80;
+      const sideReserve = landscapeTouch ? 190 : 16;
+      const availW = Math.max(120, vw - sideReserve * 2);
+      const availH = Math.max(120, vh - topReserve - bottomReserve);
+      const shapeW = maxX - minX + BASE_SCALE * 2.4;
+      const shapeH = maxY - minY + BASE_SCALE * 2.4;
+      const fitZoom = Math.min(1.4, Math.max(0.35, Math.min(availW / shapeW, availH / shapeH)));
+      const screenOffsetY = topReserve + availH / 2 - vh / 2;
+
+      setZoom(fitZoom);
       setPan({
         x: -((minX + maxX) * 0.5),
-        y: -((minY + maxY) * 0.5),
+        y: -((minY + maxY) * 0.5) + screenOffsetY / fitZoom,
       });
     },
-    [orientation]
+    [orientation, isTouch]
   );
 
   // Center on initial mount
@@ -302,7 +392,7 @@ export default function App() {
     const nextOrientation = preset.orientation ?? orientation;
     setOrientation(nextOrientation);
     setActivePresetId(preset.id);
-    setPeekAmount(0);
+    setMenuOpen(false);
     commitChange(newBlocks, preset.connectionOverrides ?? {}, {});
     centerViewOnBlocks(newBlocks, nextOrientation);
     const last = newBlocks[newBlocks.length - 1];
@@ -312,7 +402,7 @@ export default function App() {
 
   // Active Ghost Block Candidate (combines Keyboard arrow-key cursor and Mouse hover)
   const ghostCandidate: GhostCandidate | null = useMemo(() => {
-    if (toolMode !== 'build' || isPanning || isShiftHeld || Math.abs(peekAmount) > 0.01) {
+    if (toolMode !== 'build' || isPanning || isShiftHeld) {
       return null;
     }
 
@@ -352,7 +442,6 @@ export default function App() {
     toolMode,
     isPanning,
     isShiftHeld,
-    peekAmount,
     inputMode,
     kbGhost,
     blocks,
@@ -635,7 +724,7 @@ export default function App() {
       return;
     }
 
-    setInputMode('mouse');
+    if (!isTouch) setInputMode('mouse');
     const world = clientToWorld(e.clientX, e.clientY);
     setCursorWorld(world);
 
@@ -677,47 +766,122 @@ export default function App() {
     }
   };
 
+  // Closest block to a world point (within hover radius)
+  const blockAtWorld = (world: ScreenPoint): string | null => {
+    let closestId: string | null = null;
+    let minDistSq = (BASE_SCALE * 0.95) ** 2;
+    for (const b of blocks) {
+      const center = scene.blockScreenCenters.get(b.id);
+      if (!center) continue;
+      const dSq = (world.x - center.x) ** 2 + (world.y - center.y) ** 2;
+      if (dSq < minDistSq) {
+        minDistSq = dSq;
+        closestId = b.id;
+      }
+    }
+    return closestId;
+  };
+
   const handleCanvasClick = (e: React.MouseEvent<SVGSVGElement>) => {
     if (isPanning) return;
-    if (Math.abs(peekAmount) > 0.01) {
-      // Snap back to isometric lock on click
-      setPeekAmount(0);
+    if (suppressClickRef.current) {
+      suppressClickRef.current = false;
       return;
     }
+    // Resolve everything from the actual click/tap position (taps have no prior hover)
+    const world = clientToWorld(e.clientX, e.clientY);
+    const hitBlockId = world ? blockAtWorld(world) : hoveredBlockId;
 
-    // Shift + Click toggles which block face/plane visually welds
+    // Shift + Click toggles which face/plane welds at the nearest impossible joint
     if (e.shiftKey) {
-      handleToggleBlockWeldPlane(hoveredBlockId ?? selectedBlockId ?? undefined, clientToWorld(e.clientX, e.clientY));
+      handleToggleBlockWeldPlane(hitBlockId ?? selectedBlockId ?? undefined, world);
       return;
     }
 
-    // Alt/Option + Click erases hovered block quickly
-    if (e.altKey && hoveredBlockId) {
-      removeBlockById(hoveredBlockId);
+    // Alt/Option + Click erases a block quickly
+    if (e.altKey && hitBlockId) {
+      removeBlockById(hitBlockId);
       return;
     }
 
     if (toolMode === 'erase') {
-      if (hoveredBlockId) {
-        removeBlockById(hoveredBlockId);
+      if (hitBlockId) {
+        removeBlockById(hitBlockId);
       }
       return;
     }
 
     if (toolMode === 'build') {
-      if (ghostCandidate) {
-        addBlockAt(
-          ghostCandidate.x,
-          ghostCandidate.y,
-          ghostCandidate.z,
-          ghostCandidate.direction
-        );
-      } else if (hoveredBlockId) {
-        setSelectedBlockId(hoveredBlockId);
-        const b = blocks.find((blk) => blk.id === hoveredBlockId);
+      const cand = world
+        ? findBestGhostCandidate(world.x, world.y, blocks, orientation, BASE_SCALE)
+        : ghostCandidate;
+      if (cand) {
+        addBlockAt(cand.x, cand.y, cand.z, cand.direction);
+      } else if (hitBlockId) {
+        setSelectedBlockId(hitBlockId);
+        const b = blocks.find((blk) => blk.id === hitBlockId);
         syncKbGhostFromBlock(b, lastBuildDir);
       }
     }
+  };
+
+  // Touch gestures: one-finger drag pans, two-finger pinch zooms
+  const handleTouchStart = (e: React.TouchEvent<SVGSVGElement>) => {
+    if (e.touches.length === 1) {
+      const t = e.touches[0];
+      touchRef.current = {
+        mode: 'pan',
+        startX: t.clientX,
+        startY: t.clientY,
+        panX: pan.x,
+        panY: pan.y,
+        dist: 0,
+        zoom,
+        moved: false,
+      };
+    } else if (e.touches.length === 2) {
+      const [a, b] = [e.touches[0], e.touches[1]];
+      touchRef.current = {
+        mode: 'pinch',
+        startX: (a.clientX + b.clientX) / 2,
+        startY: (a.clientY + b.clientY) / 2,
+        panX: pan.x,
+        panY: pan.y,
+        dist: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY),
+        zoom,
+        moved: true,
+      };
+    }
+  };
+
+  const handleTouchMove = (e: React.TouchEvent<SVGSVGElement>) => {
+    const st = touchRef.current;
+    if (!st) return;
+    if (st.mode === 'pan' && e.touches.length === 1) {
+      const t = e.touches[0];
+      const dx = t.clientX - st.startX;
+      const dy = t.clientY - st.startY;
+      if (!st.moved && Math.abs(dx) + Math.abs(dy) < 10) return;
+      st.moved = true;
+      setPan({ x: st.panX + dx / zoom, y: st.panY + dy / zoom });
+    } else if (st.mode === 'pinch' && e.touches.length === 2) {
+      const [a, b] = [e.touches[0], e.touches[1]];
+      const d = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+      if (st.dist > 0) {
+        setZoom(Math.min(3.0, Math.max(0.35, st.zoom * (d / st.dist))));
+      }
+    }
+  };
+
+  const handleTouchEnd = (e: React.TouchEvent<SVGSVGElement>) => {
+    const st = touchRef.current;
+    if (st?.moved) {
+      suppressClickRef.current = true;
+      window.setTimeout(() => {
+        suppressClickRef.current = false;
+      }, 400);
+    }
+    if (e.touches.length === 0) touchRef.current = null;
   };
 
   const handleContextMenu = (e: React.MouseEvent<SVGSVGElement>) => {
@@ -799,10 +963,6 @@ export default function App() {
       // Spacebar places the block at the current ghost position
       if (e.code === 'Space' || e.key === ' ') {
         e.preventDefault();
-        if (Math.abs(peekAmount) > 0.01) {
-          setPeekAmount(0);
-          return;
-        }
         setToolMode('build');
         setInputMode('keyboard');
         if (ghostCandidate) {
@@ -818,7 +978,6 @@ export default function App() {
 
       if (e.key === '1') setToolMode('build');
       if (e.key === '2') setToolMode('erase');
-      if (e.key === '3') setToolMode('connect');
       if (e.key.toLowerCase() === 'g') setShowGrid((g) => !g);
       if (e.key.toLowerCase() === 'v') setShowVoxelSeams((v) => !v);
       if (e.key === 'Backspace' || e.key === 'Delete') {
@@ -846,7 +1005,6 @@ export default function App() {
     handleRedo,
     moveNextBlockCursor,
     handleToggleBlockWeldPlane,
-    peekAmount,
     ghostCandidate,
     addBlockAt,
     lastBuildDir,
@@ -956,7 +1114,7 @@ export default function App() {
   const backgroundGridLines = useMemo(() => {
     if (!showGrid) return [];
     const lines: Array<{ key: string; p1: ScreenPoint; p2: ScreenPoint }> = [];
-    const N = 16;
+    const N = 40;
     for (let i = -N; i <= N; i++) {
       // Constant v lines (u from -N to N)
       lines.push({
@@ -982,27 +1140,6 @@ export default function App() {
     return lines;
   }, [showGrid, orientation]);
 
-  // Blocks sorted by true 3D depth for "3D Illusion Peek" mode
-  const peekSortedBlocks = useMemo(() => {
-    if (Math.abs(peekAmount) <= 0.01) return [];
-    return [...blocks]
-      .sort((a, b) => blockDepth(a.x, a.y, a.z) - blockDepth(b.x, b.y, b.z))
-      .map((b) => {
-        const lc = blockToLattice(b.x, b.y, b.z);
-        const d = blockDepth(b.x, b.y, b.z);
-        const offset: ScreenPoint = {
-          x: d * peekAmount * 22,
-          y: -d * peekAmount * 16,
-        };
-        const center = latticeToScreen(lc.u, lc.v, orientation, BASE_SCALE);
-        return {
-          block: b,
-          depth: d,
-          center: { x: center.x + offset.x, y: center.y + offset.y },
-          rhombuses: getBlockRhombuses(lc.u, lc.v, orientation, BASE_SCALE, offset),
-        };
-      });
-  }, [blocks, peekAmount, orientation]);
 
   const activeEscherCount = scene.connections.filter((c) => c.mode !== 'disconnected').length;
 
@@ -1114,996 +1251,657 @@ export default function App() {
     }
   };
 
+  // Keyboard/D-pad "next block" ghost (independent of mouse hover)
+  const kbCandidate: GhostCandidate | null = useMemo(() => {
+    if (toolMode !== 'build') return null;
+    return resolveGhostAtLattice(
+      kbGhost.u,
+      kbGhost.v,
+      { x: kbGhost.x, y: kbGhost.y, z: kbGhost.z },
+      blocks,
+      selectedBlockId,
+      orientation,
+      BASE_SCALE
+    );
+  }, [toolMode, kbGhost, blocks, selectedBlockId, orientation]);
+
+  const placeKbBlock = () => {
+    setToolMode('build');
+    setInputMode('keyboard');
+    if (kbCandidate) {
+      addBlockAt(kbCandidate.x, kbCandidate.y, kbCandidate.z, kbCandidate.direction ?? lastBuildDir);
+    }
+  };
+
+  // Toggle the weld of the most recently added block
+  const toggleLastBlockWeld = () => {
+    const last = blocks[blocks.length - 1];
+    if (last) handleToggleBlockWeldPlane(last.id);
+  };
+
+  // D-pad: place each of the 6 isometric directions at its true on-screen angle
+  const dpadDirs = useMemo(
+    () =>
+      (['+X', '-X', '+Y', '-Y', '+Z', '-Z'] as AxisDirection[]).map((dir) => {
+        const d = AXIS_DELTAS[dir];
+        const p = latticeToScreen(d.du, d.dv, orientation, 1);
+        const len = Math.hypot(p.x, p.y) || 1;
+        return { dir, nx: p.x / len, ny: p.y / len };
+      }),
+    [orientation]
+  );
+
+  // Track canvas size so the drawing stays centered on any screen
+  useEffect(() => {
+    const el = svgRef.current;
+    if (!el) return;
+    const update = () => setViewSize({ w: el.clientWidth, h: el.clientHeight });
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Auto-hide the weld toast
+  useEffect(() => {
+    if (!lastWeldBanner) return;
+    const t = window.setTimeout(() => setLastWeldBanner(null), 2600);
+    return () => window.clearTimeout(t);
+  }, [lastWeldBanner]);
+
+  const loadEmptyCanvas = () => {
+    setActivePresetId('empty');
+    commitChange([], {}, {});
+    setSelectedBlockId(null);
+    syncKbGhostFromBlock(undefined);
+    setMenuOpen(false);
+  };
+
+  const ctrlBtn =
+    'flex items-center justify-center rounded-xl bg-neutral-900/90 backdrop-blur-md border border-neutral-700/80 text-neutral-200 hover:text-white hover:bg-neutral-800 active:scale-95 shadow-lg transition select-none';
+
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-neutral-950 text-neutral-100 font-sans">
-      {/* LEFT SIDEBAR: Presets, Tools & Isometric Extrusion Pad */}
-      <aside className="w-80 flex-shrink-0 border-r border-neutral-800/80 bg-neutral-900/90 backdrop-blur-md flex flex-col justify-between z-20">
-        <div className="p-4 space-y-5 overflow-y-auto">
-          {/* App Header */}
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2.5">
-              <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-amber-400 to-orange-600 flex items-center justify-center shadow-lg shadow-amber-500/20 text-neutral-950 font-black">
-                <Box className="w-5 h-5 stroke-[2.5]" />
-              </div>
-              <div>
-                <h1 className="text-base font-bold tracking-tight text-white flex items-center gap-1.5">
-                  EscherCAD
-                  <span className="text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30">
-                    Iso-3D
-                  </span>
-                </h1>
-                <p className="text-xs text-neutral-400">Impossible Shape Studio</p>
-              </div>
-            </div>
-            <button
-              onClick={() => setShowHelpModal(true)}
-              className="p-2 rounded-lg text-neutral-400 hover:text-white hover:bg-neutral-800 transition"
-              title="How Impossible Shapes Work"
+    <div className="relative h-[100dvh] w-screen overflow-hidden bg-neutral-950 text-neutral-100 font-sans">
+      {/* FULL-SCREEN INTERACTIVE ISOMETRIC CANVAS */}
+      <svg
+        ref={svgRef}
+        onMouseMove={handleMouseMove}
+        onMouseDown={handleMouseDown}
+        onMouseUp={handleMouseUp}
+        onClick={handleCanvasClick}
+        onContextMenu={handleContextMenu}
+        onWheel={handleWheel}
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
+        style={{ backgroundColor: theme.canvasBg, touchAction: 'none' }}
+        className={`absolute inset-0 w-full h-full transition-colors duration-200 ${
+          isPanning
+            ? 'cursor-grabbing'
+            : isShiftHeld || toolMode === 'erase'
+              ? 'cursor-pointer'
+              : 'cursor-crosshair'
+        }`}
+      >
+        <g
+          transform={`translate(${viewSize.w * 0.5}, ${viewSize.h * 0.5}) scale(${zoom}) translate(${pan.x}, ${pan.y})`}
+        >
+          {/* 1. Isometric Lattice Grid */}
+          {showGrid && (
+            <g className="pointer-events-none">
+              {backgroundGridLines.map((line) => (
+                <line
+                  key={line.key}
+                  x1={line.p1.x}
+                  y1={line.p1.y}
+                  x2={line.p2.x}
+                  y2={line.p2.y}
+                  stroke={theme.gridLine}
+                  strokeWidth={0.75}
+                  strokeOpacity={0.55}
+                />
+              ))}
+            </g>
+          )}
+
+          {/* 2. Filled Triangles (merged Escher ribbons) */}
+          <g>
+            {scene.triangles.map((tri) => {
+              const fill =
+                tri.faceType === 'X' ? theme.faceX : tri.faceType === 'Y' ? theme.faceY : theme.faceZ;
+              const isHoveredErase = toolMode === 'erase' && hoveredBlockId === tri.blockId;
+              const isHoveredShiftWeld = isShiftHeld && hoveredBlockId === tri.blockId;
+              return (
+                <polygon
+                  key={tri.key}
+                  points={pointsToSvgPolygon(tri.points)}
+                  fill={isHoveredErase ? '#f43f5e' : fill}
+                  stroke={isHoveredErase ? '#f43f5e' : isHoveredShiftWeld ? '#06b6d4' : fill}
+                  strokeWidth={isHoveredShiftWeld ? 1.8 : 0.65}
+                  strokeLinejoin="round"
+                  onMouseEnter={() => setHoveredBlockId(tri.blockId)}
+                  onClick={(e) => {
+                    if (e.shiftKey) {
+                      e.stopPropagation();
+                      handleToggleBlockWeldPlane(tri.blockId, clientToWorld(e.clientX, e.clientY));
+                    }
+                  }}
+                />
+              );
+            })}
+          </g>
+
+          {/* Optional Internal Voxel Seams */}
+          {showVoxelSeams && (
+            <g className="pointer-events-none">
+              {scene.seamEdges.map((edge) => (
+                <line
+                  key={edge.key}
+                  x1={edge.p1.x}
+                  y1={edge.p1.y}
+                  x2={edge.p2.x}
+                  y2={edge.p2.y}
+                  stroke={theme.stroke}
+                  strokeWidth={strokeWidth * 0.45}
+                  strokeOpacity={0.4}
+                  strokeDasharray="4 4"
+                  strokeLinecap="round"
+                />
+              ))}
+            </g>
+          )}
+
+          {/* Crisp Merged Contour & Crease Outlines */}
+          <g className="pointer-events-none">
+            {scene.edges.map((edge) => (
+              <line
+                key={edge.key}
+                x1={edge.p1.x}
+                y1={edge.p1.y}
+                x2={edge.p2.x}
+                y2={edge.p2.y}
+                stroke={theme.stroke}
+                strokeWidth={strokeWidth}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            ))}
+          </g>
+
+          {/* Selected Block Anchor Dot */}
+          {selectedBlockId && scene.blockScreenCenters.has(selectedBlockId) && (
+            <circle
+              cx={scene.blockScreenCenters.get(selectedBlockId)!.x}
+              cy={scene.blockScreenCenters.get(selectedBlockId)!.y}
+              r={4}
+              fill="#f59e0b"
+              stroke="#000"
+              strokeWidth={1.5}
+              className="pointer-events-none opacity-75"
+            />
+          )}
+
+          {/* Shift-Hover: highlight the impossible joint that Shift+Click will toggle */}
+          {isShiftHeld && hoveredBlockId && (
+            <g
+              transform={`translate(${
+                (activeJoint?.center ?? scene.blockScreenCenters.get(hoveredBlockId))?.x ?? 0
+              }, ${(activeJoint?.center ?? scene.blockScreenCenters.get(hoveredBlockId))?.y ?? 0})`}
+              className="pointer-events-none"
             >
-              <HelpCircle className="w-4 h-4" />
-            </button>
-          </div>
+              {activeJoint && (
+                <circle r={9} fill="none" stroke="#06b6d4" strokeWidth={2.5} strokeDasharray="3 2" />
+              )}
+              <g transform="translate(0, -30)">
+                <rect
+                  x={-104}
+                  y={-12}
+                  width={208}
+                  height={22}
+                  rx={11}
+                  fill="#09090b"
+                  fillOpacity={0.92}
+                  stroke="#06b6d4"
+                  strokeWidth={1.5}
+                />
+                <text x={0} y={3} textAnchor="middle" fill="#67e8f9" fontSize={10} fontWeight="bold">
+                  {activeJoint
+                    ? `⇧+Click: ${WELD_PLANE_LABELS[activeJoint.plane]}`
+                    : 'No impossible joint here'}
+                </text>
+              </g>
+            </g>
+          )}
 
-          {/* Primary Tool Selector */}
-          <div>
-            <div className="text-[11px] font-semibold uppercase tracking-wider text-neutral-400 mb-2 flex items-center justify-between">
-              <span>Interaction Mode</span>
-              <span className="text-[10px] text-neutral-500">Keys 1 · 2 · 3</span>
-            </div>
-            <div className="grid grid-cols-3 gap-1.5 p-1 bg-neutral-950 rounded-xl border border-neutral-800">
-              <button
-                onClick={() => setToolMode('build')}
-                className={`flex flex-col items-center gap-1 py-2 px-2 rounded-lg text-xs font-medium transition ${
-                  toolMode === 'build'
-                    ? 'bg-amber-500 text-neutral-950 shadow-md shadow-amber-500/20 font-semibold'
-                    : 'text-neutral-400 hover:text-white hover:bg-neutral-900'
-                }`}
-              >
-                <Plus className="w-4 h-4" />
-                <span>Add Block</span>
-              </button>
-              <button
-                onClick={() => setToolMode('erase')}
-                className={`flex flex-col items-center gap-1 py-2 px-2 rounded-lg text-xs font-medium transition ${
-                  toolMode === 'erase'
-                    ? 'bg-rose-500 text-white shadow-md shadow-rose-500/20 font-semibold'
-                    : 'text-neutral-400 hover:text-white hover:bg-neutral-900'
-                }`}
-              >
-                <Eraser className="w-4 h-4" />
-                <span>Erase</span>
-              </button>
-              <button
-                onClick={() => setToolMode('connect')}
-                className={`flex flex-col items-center gap-1 py-2 px-2 rounded-lg text-xs font-medium transition ${
-                  toolMode === 'connect'
-                    ? 'bg-cyan-400 text-neutral-950 shadow-md shadow-cyan-400/20 font-semibold'
-                    : 'text-neutral-400 hover:text-white hover:bg-neutral-900'
-                }`}
-              >
-                <Zap className="w-4 h-4" />
-                <span>Welds ({scene.connections.length})</span>
-              </button>
-            </div>
-          </div>
+          {/* Ghost Block Preview in Build Mode */}
+          {ghostCandidate && (
+            <g className="pointer-events-none">
+              {(['faceX', 'faceY', 'faceZ'] as const).map((face) => (
+                <polygon
+                  key={face}
+                  points={pointsToSvgPolygon(ghostCandidate.rhombuses[face])}
+                  fill={face === 'faceX' ? theme.faceX : face === 'faceY' ? theme.faceY : theme.faceZ}
+                  fillOpacity={face === 'faceZ' ? 0.62 : 0.48}
+                  stroke={ghostCandidate.willEscherConnect ? '#f59e0b' : '#06b6d4'}
+                  strokeWidth={2.0}
+                  strokeDasharray={ghostCandidate.willEscherConnect ? undefined : '5 3'}
+                />
+              ))}
+            </g>
+          )}
 
-          {/* Auto-Connect & Escher Paradox Status */}
-          <div className="p-3 rounded-xl bg-neutral-950/90 border border-neutral-800 space-y-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Sparkles className="w-4 h-4 text-amber-400" />
-                <span className="text-xs font-semibold text-neutral-200">
-                  Auto-Connect Impossible Joints
-                </span>
+          {/* Optional Interactive Escher Weld Badges */}
+          {showConnectionBadges &&
+            scene.connections.map((conn) => {
+              const isFlipped = conn.mode === 'flipped';
+              const isDisconnected = conn.mode === 'disconnected';
+              return (
+                <g
+                  key={conn.id}
+                  transform={`translate(${conn.screenPos.x}, ${conn.screenPos.y})`}
+                  onClick={(e) => handleCycleConnection(conn, e)}
+                  className="cursor-pointer group"
+                >
+                  <circle r={16} fill="transparent" className="group-hover:fill-amber-400/20 transition" />
+                  <circle
+                    r={10.5}
+                    fill={isDisconnected ? '#27272a' : isFlipped ? '#06b6d4' : '#f59e0b'}
+                    stroke="#09090b"
+                    strokeWidth={2}
+                  />
+                  <text
+                    x={0}
+                    y={3.5}
+                    textAnchor="middle"
+                    fontSize={10}
+                    fontWeight="bold"
+                    fill={isDisconnected ? '#a1a1aa' : '#09090b'}
+                  >
+                    {isDisconnected ? '×' : isFlipped ? '⇄' : '⚡'}
+                  </text>
+                </g>
+              );
+            })}
+        </g>
+      </svg>
+
+      {/* TOP-LEFT: Hamburger menu button */}
+      <button
+        onClick={() => setMenuOpen(true)}
+        className={`${ctrlBtn} absolute top-3 left-3 z-20 w-11 h-11`}
+        style={{ marginTop: 'env(safe-area-inset-top)' }}
+        title="Menu"
+        aria-label="Open menu"
+      >
+        <Menu className="w-5 h-5" />
+      </button>
+
+      {/* Weld toast */}
+      {lastWeldBanner && (
+        <div
+          className="absolute top-3 left-1/2 -translate-x-1/2 z-20 max-w-[70vw] px-3 py-2 rounded-xl bg-neutral-900/95 border border-cyan-500/40 text-cyan-200 text-xs font-medium shadow-lg pointer-events-none text-center"
+          style={{ marginTop: 'env(safe-area-inset-top)' }}
+        >
+          {lastWeldBanner}
+        </div>
+      )}
+
+      {/* ZOOM + CENTER (top-right on touch, bottom-left on desktop) */}
+      <div
+        className={`absolute z-10 flex items-center gap-1 p-1 rounded-xl bg-neutral-900/90 backdrop-blur-md border border-neutral-700/80 shadow-lg ${
+          isTouch ? 'top-3 right-3' : 'bottom-4 left-4'
+        }`}
+        style={isTouch ? { marginTop: 'env(safe-area-inset-top)' } : undefined}
+      >
+        <button
+          onClick={() => setZoom((z) => Math.max(0.35, z * 0.85))}
+          className="w-9 h-9 flex items-center justify-center rounded-lg text-neutral-300 hover:text-white hover:bg-neutral-800 transition"
+          title="Zoom Out"
+        >
+          <ZoomOut className="w-4 h-4" />
+        </button>
+        <button
+          onClick={() => setZoom((z) => Math.min(3.0, z * 1.15))}
+          className="w-9 h-9 flex items-center justify-center rounded-lg text-neutral-300 hover:text-white hover:bg-neutral-800 transition"
+          title="Zoom In"
+        >
+          <ZoomIn className="w-4 h-4" />
+        </button>
+        <button
+          onClick={() => centerViewOnBlocks(blocks)}
+          className="h-9 px-2.5 rounded-lg text-xs font-medium text-neutral-300 hover:text-white hover:bg-neutral-800 flex items-center gap-1 transition"
+          title="Center View"
+        >
+          <Maximize2 className="w-3.5 h-3.5" />
+          Center
+        </button>
+      </div>
+
+      {/* PRIMARY CONTROLS: Add/Erase + Toggle Weld (+ Undo on touch) */}
+      <div
+        className={`absolute z-10 flex gap-2 ${
+          isTouch ? 'left-3 flex-col items-start' : 'bottom-4 left-1/2 -translate-x-1/2 items-center'
+        }`}
+        style={isTouch ? { bottom: 'calc(env(safe-area-inset-bottom) + 12px)' } : undefined}
+      >
+        <div className="flex p-1 rounded-xl bg-neutral-900/90 backdrop-blur-md border border-neutral-700/80 shadow-lg">
+          <button
+            onClick={() => setToolMode('build')}
+            className={`h-10 px-3 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition ${
+              toolMode === 'build' ? 'bg-amber-500 text-neutral-950' : 'text-neutral-300 hover:text-white'
+            }`}
+          >
+            <Plus className="w-4 h-4" />
+            Add
+          </button>
+          <button
+            onClick={() => setToolMode('erase')}
+            className={`h-10 px-3 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition ${
+              toolMode === 'erase' ? 'bg-rose-500 text-white' : 'text-neutral-300 hover:text-white'
+            }`}
+          >
+            <Eraser className="w-4 h-4" />
+            Erase
+          </button>
+        </div>
+        <button
+          onClick={toggleLastBlockWeld}
+          disabled={blocks.length === 0}
+          className={`${ctrlBtn} h-12 px-3.5 gap-2 text-xs font-semibold text-cyan-200 border-cyan-500/40 disabled:opacity-40`}
+          title="Toggle the weld plane at the last block you added (W / Shift+Click)"
+        >
+          <FlipHorizontal2 className="w-4 h-4 text-cyan-400" />
+          Toggle Weld
+          {!isTouch && (
+            <kbd className="px-1.5 py-0.5 text-[10px] font-mono bg-neutral-950 text-cyan-300 rounded border border-neutral-800">
+              W
+            </kbd>
+          )}
+        </button>
+        {isTouch && (
+          <button
+            onClick={handleUndo}
+            disabled={past.length === 0}
+            className={`${ctrlBtn} h-12 px-3.5 gap-2 text-xs font-semibold disabled:opacity-40`}
+            title="Undo"
+          >
+            <Undo2 className="w-4 h-4" />
+            Undo
+          </button>
+        )}
+      </div>
+
+      {/* TOUCH D-PAD: 6 isometric directions around a central Place button */}
+      {isTouch && (
+        <div
+          className="absolute right-3 z-10 w-44 h-44"
+          style={{ bottom: 'calc(env(safe-area-inset-bottom) + 12px)' }}
+        >
+          {dpadDirs.map(({ dir, nx, ny }) => {
+            const angle = (Math.atan2(ny, nx) * 180) / Math.PI + 90;
+            const active = lastBuildDir === dir;
+            return (
+              <button
+                key={dir}
+                onClick={() => moveNextBlockCursor(dir)}
+                className={`${ctrlBtn.replace('rounded-xl', 'rounded-full')} absolute w-12 h-12 ${
+                  active ? 'border-amber-500 text-amber-300' : ''
+                }`}
+                style={{
+                  left: `calc(50% + ${nx * 62}px - 24px)`,
+                  top: `calc(50% + ${ny * 62}px - 24px)`,
+                }}
+                aria-label={`Move next block ${dir}`}
+              >
+                <ArrowUp className="w-5 h-5" style={{ transform: `rotate(${angle}deg)` }} />
+              </button>
+            );
+          })}
+          <button
+            onClick={placeKbBlock}
+            className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-14 h-14 rounded-full bg-amber-500 hover:bg-amber-400 active:scale-95 text-neutral-950 shadow-lg shadow-amber-500/30 flex items-center justify-center transition"
+            aria-label="Place block"
+          >
+            <Plus className="w-7 h-7 stroke-[3]" />
+          </button>
+        </div>
+      )}
+
+      {/* HAMBURGER DRAWER: Settings / Starters / Export */}
+      {menuOpen && (
+        <div className="fixed inset-0 z-40 flex" onClick={() => setMenuOpen(false)}>
+          <div className="absolute inset-0 bg-black/55 backdrop-blur-[2px]" />
+          <aside
+            className="relative h-full w-[88vw] max-w-sm bg-neutral-900 border-r border-neutral-800 shadow-2xl flex flex-col"
+            style={{ paddingTop: 'env(safe-area-inset-top)', paddingBottom: 'env(safe-area-inset-bottom)' }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div className="flex items-center justify-between p-4 border-b border-neutral-800">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-amber-400 to-orange-600 flex items-center justify-center text-neutral-950">
+                  <Box className="w-5 h-5 stroke-[2.5]" />
+                </div>
+                <div>
+                  <h1 className="text-base font-bold tracking-tight text-white">EscherCAD</h1>
+                  <p className="text-xs text-neutral-400">Impossible Shape Studio</p>
+                </div>
               </div>
               <button
-                onClick={() => setAutoConnect((a) => !a)}
-                className={`w-10 h-5 flex items-center rounded-full p-0.5 transition ${
-                  autoConnect ? 'bg-amber-500 justify-end' : 'bg-neutral-700 justify-start'
-                }`}
+                onClick={() => setMenuOpen(false)}
+                className="w-10 h-10 flex items-center justify-center rounded-lg text-neutral-400 hover:text-white hover:bg-neutral-800"
+                aria-label="Close menu"
               >
-                <span className="w-4 h-4 rounded-full bg-white shadow" />
+                <X className="w-5 h-5" />
               </button>
             </div>
-            <p className="text-[11px] text-neutral-400 leading-relaxed">
-              When two blocks at different 3D depths visually touch in isometric projection, they
-              automatically fuse into a seamless Escher ribbon.
-            </p>
-            {scene.connections.length > 0 && (
-              <div className="pt-1 border-t border-neutral-800/80 flex items-center justify-between text-[11px]">
-                <span className="text-amber-300 font-medium flex items-center gap-1">
-                  <Zap className="w-3.5 h-3.5" />
-                  {activeEscherCount} active Escher{' '}
-                  {activeEscherCount === 1 ? 'weld' : 'welds'}
-                </span>
-                <span className="text-neutral-400">⇧+Click block to change weld plane</span>
-              </div>
-            )}
-          </div>
 
-          {/* 6-Direction Step Builder Pad + Keyboard Controls */}
-          <div className="p-3 rounded-xl bg-neutral-950/80 border border-neutral-800 space-y-2.5">
-            <div className="flex items-center justify-between">
-              <span className="text-[11px] font-semibold uppercase tracking-wider text-neutral-400 flex items-center gap-1.5">
-                <Compass className="w-3.5 h-3.5 text-amber-400" />
-                Move Next Block
-              </span>
-              <span className="text-[10px] font-mono text-amber-300/90">Arrows + Space</span>
-            </div>
-            <div className="grid grid-cols-3 gap-1.5 pt-0.5">
+            {/* Section tabs */}
+            <div className="grid grid-cols-3 gap-1 m-3 p-1 bg-neutral-950 rounded-xl border border-neutral-800">
               {(
                 [
-                  { dir: '+X', keyHint: '←' },
-                  { dir: '+Y', keyHint: 'E / ⇧↓' },
-                  { dir: '+Z', keyHint: '↑' },
-                  { dir: '-X', keyHint: '→' },
-                  { dir: '-Y', keyHint: 'Q / ⇧↑' },
-                  { dir: '-Z', keyHint: '↓' },
-                ] as Array<{ dir: AxisDirection; keyHint: string }>
-              ).map(({ dir, keyHint }) => {
-                const isCurrentDir = ghostCandidate?.direction === dir;
-                return (
-                  <button
-                    key={dir}
-                    onClick={() => moveNextBlockCursor(dir)}
-                    className={`px-2 py-1.5 rounded-lg border text-xs font-mono flex flex-col items-center justify-center gap-0.5 transition ${
-                      isCurrentDir
-                        ? 'bg-amber-500/20 border-amber-500 text-amber-200'
-                        : 'bg-neutral-900 hover:bg-neutral-800 border-neutral-800 hover:border-amber-500/40 text-neutral-200'
-                    }`}
-                    title={`Move next block along ${AXIS_DELTAS[dir].label} (${keyHint})`}
-                  >
-                    <span className="font-bold">{dir}</span>
-                    <span className="text-[9px] text-neutral-400">{keyHint}</span>
-                  </button>
-                );
-              })}
+                  { id: 'starters', label: 'Starters', icon: Layers },
+                  { id: 'settings', label: 'Settings', icon: Settings },
+                  { id: 'export', label: 'Export', icon: Download },
+                ] as const
+              ).map(({ id, label, icon: Icon }) => (
+                <button
+                  key={id}
+                  onClick={() => setMenuSection(id)}
+                  className={`py-2 rounded-lg text-xs font-semibold flex flex-col items-center gap-1 transition ${
+                    menuSection === id
+                      ? 'bg-amber-500 text-neutral-950'
+                      : 'text-neutral-400 hover:text-white hover:bg-neutral-900'
+                  }`}
+                >
+                  <Icon className="w-4 h-4" />
+                  {label}
+                </button>
+              ))}
             </div>
-            <button
-              onClick={() => {
-                if (ghostCandidate) {
-                  addBlockAt(
-                    ghostCandidate.x,
-                    ghostCandidate.y,
-                    ghostCandidate.z,
-                    ghostCandidate.direction ?? lastBuildDir
-                  );
-                }
-              }}
-              className="w-full py-2 px-3 rounded-lg bg-amber-500 hover:bg-amber-400 text-neutral-950 text-xs font-bold flex items-center justify-center gap-1.5 shadow-md shadow-amber-500/15 transition"
-            >
-              <Plus className="w-3.5 h-3.5 stroke-[2.5]" />
-              <span>Add Next Block</span>
-              <kbd className="ml-1 px-1.5 py-0.5 text-[10px] font-mono bg-neutral-950/20 rounded">
-                Space
-              </kbd>
-            </button>
 
-            {/* Shift + Click Weld Plane Toggle Button */}
-            <div className="pt-2 border-t border-neutral-800/80 space-y-1.5">
-              <div className="flex items-center justify-between text-[11px]">
-                <span className="text-neutral-400">Joint Weld:</span>
-                <span className="font-mono text-cyan-300 font-semibold">
-                  {activeJoint ? WELD_PLANE_LABELS[activeJoint.plane] : 'No joint nearby'}
-                </span>
-              </div>
-              <button
-                onClick={() => handleToggleBlockWeldPlane()}
-                className="w-full py-1.5 px-2.5 rounded-lg bg-neutral-900 hover:bg-neutral-800 border border-cyan-500/40 text-cyan-200 text-xs font-medium flex items-center justify-between transition"
-                title="Toggle which face/plane of the block visually welds (Shift+Click any block or press W)"
-              >
-                <span className="flex items-center gap-1.5">
-                  <FlipHorizontal2 className="w-3.5 h-3.5 text-cyan-400" />
-                  <span>Toggle Weld Plane</span>
-                </span>
-                <kbd className="px-1.5 py-0.5 text-[10px] font-mono bg-neutral-950 text-cyan-300 rounded border border-neutral-800">
-                  ⇧+Click / W
-                </kbd>
-              </button>
-            </div>
-          </div>
-
-          {/* Shape Presets Gallery */}
-          <div>
-            <div className="text-[11px] font-semibold uppercase tracking-wider text-neutral-400 mb-2">
-              Escher & Penrose Presets
-            </div>
-            <div className="space-y-1.5">
-              {SHAPE_PRESETS.map((preset) => {
-                const isSelected = activePresetId === preset.id;
-                return (
-                  <button
-                    key={preset.id}
-                    onClick={() => handleLoadPreset(preset)}
-                    className={`w-full text-left px-3 py-2.5 rounded-xl border transition flex items-center justify-between ${
-                      isSelected
-                        ? 'bg-amber-500/15 border-amber-500/50 text-white'
-                        : 'bg-neutral-950/60 border-neutral-800/80 text-neutral-300 hover:bg-neutral-800/60 hover:text-white'
-                    }`}
-                  >
-                    <div>
-                      <div className="text-xs font-semibold flex items-center gap-1.5">
-                        {preset.name}
-                      </div>
-                      <div className="text-[11px] text-neutral-400">{preset.subtitle}</div>
-                    </div>
-                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-neutral-900 text-neutral-400 border border-neutral-800">
-                      {preset.blocks.length}b
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        </div>
-
-        {/* Bottom Actions: Undo, Redo, Clear */}
-        <div className="p-3 border-t border-neutral-800 bg-neutral-950/60 flex items-center justify-between gap-2">
-          <div className="flex items-center gap-1">
-            <button
-              onClick={handleUndo}
-              disabled={past.length === 0}
-              className="p-2 rounded-lg bg-neutral-900 border border-neutral-800 text-neutral-300 hover:text-white disabled:opacity-35 disabled:pointer-events-none transition"
-              title="Undo (Cmd+Z)"
-            >
-              <Undo2 className="w-4 h-4" />
-            </button>
-            <button
-              onClick={handleRedo}
-              disabled={future.length === 0}
-              className="p-2 rounded-lg bg-neutral-900 border border-neutral-800 text-neutral-300 hover:text-white disabled:opacity-35 disabled:pointer-events-none transition"
-              title="Redo (Cmd+Shift+Z)"
-            >
-              <Redo2 className="w-4 h-4" />
-            </button>
-          </div>
-
-          <button
-            onClick={() => {
-              const starter = { id: `b_${Date.now()}_0`, x: 0, y: 0, z: 0 };
-              setActivePresetId('custom');
-              commitChange([starter], {}, {});
-              centerViewOnBlocks([starter]);
-              setSelectedBlockId(starter.id);
-              syncKbGhostFromBlock(starter, '+Y');
-            }}
-            className="flex-1 py-2 px-3 rounded-lg bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 text-xs font-medium text-neutral-300 hover:text-white flex items-center justify-center gap-1.5 transition"
-          >
-            <RotateCcw className="w-3.5 h-3.5" />
-            Reset to 1 Block
-          </button>
-
-          <button
-            onClick={() => {
-              setActivePresetId('empty');
-              commitChange([], {}, {});
-              setSelectedBlockId(null);
-              syncKbGhostFromBlock(undefined);
-            }}
-            className="p-2 rounded-lg bg-neutral-900 hover:bg-rose-950/60 border border-neutral-800 hover:border-rose-500/40 text-neutral-400 hover:text-rose-300 transition"
-            title="Clear Canvas"
-          >
-            <Trash2 className="w-4 h-4" />
-          </button>
-        </div>
-      </aside>
-
-      {/* CENTER INTERACTIVE ISOMETRIC VIEWPORT */}
-      <main className="relative flex-1 h-full overflow-hidden flex flex-col">
-        {/* Top Floating HUD Bar */}
-        <div className="absolute top-4 left-4 right-4 flex items-center justify-between pointer-events-none z-10">
-          {/* Left status pill */}
-          <div className="pointer-events-auto flex items-center gap-2 px-3.5 py-2 rounded-xl bg-neutral-900/90 backdrop-blur-md border border-neutral-800 shadow-lg text-xs">
-            <span className="flex items-center gap-1.5 font-medium text-neutral-200">
-              <Layers className="w-3.5 h-3.5 text-amber-400" />
-              {blocks.length} {blocks.length === 1 ? 'Block' : 'Blocks'}
-            </span>
-            <span className="text-neutral-700">|</span>
-            <span className="text-neutral-300">
-              {isShiftHeld
-                ? '⇧ Shift+Click any block to toggle which block face/plane visually welds'
-                : toolMode === 'build'
-                  ? ghostCandidate
-                    ? ghostCandidate.willEscherConnect
-                      ? '⚡ Space (or Click): Escher-weld · ⇧+Click block: Toggle weld plane'
-                      : `Arrows: Move (${
-                          ghostCandidate.direction ?? 'grid'
-                        }) · Space: Add · ⇧+Click: Toggle Weld Plane`
-                    : 'Arrows: Move · Space: Add · ⇧+Click: Toggle Weld Plane'
-                  : toolMode === 'erase'
-                    ? 'Click any block to remove it'
-                    : 'Click ⚡ badge or ⇧+Click any block to toggle which face welds'}
-            </span>
-            {lastWeldBanner && (
-              <>
-                <span className="text-neutral-700">|</span>
-                <span className="px-2 py-0.5 rounded-md bg-cyan-500/20 border border-cyan-500/40 text-cyan-300 font-mono text-[11px]">
-                  {lastWeldBanner}
-                </span>
-              </>
-            )}
-          </div>
-
-          {/* Right Action & Export Buttons */}
-          <div className="pointer-events-auto flex items-center gap-2">
-            <button
-              onClick={handleOpenSuggestionModal}
-              className="px-3 py-2 rounded-xl bg-neutral-900/90 hover:bg-neutral-800 backdrop-blur-md border border-cyan-500/40 text-xs font-medium text-cyan-200 hover:text-white flex items-center gap-1.5 shadow-lg transition"
-              title="Open suggestion form to file a GitHub Issue on arussellturner/impossible-shapes"
-            >
-              <MessageSquarePlus className="w-3.5 h-3.5 text-cyan-400" />
-              Offer a Suggestion to Improve This
-            </button>
-            <button
-              onClick={handleExportSvg}
-              className="px-3 py-2 rounded-xl bg-neutral-900/90 hover:bg-neutral-800 backdrop-blur-md border border-neutral-800 text-xs font-medium text-neutral-200 flex items-center gap-1.5 shadow-lg transition"
-            >
-              <Download className="w-3.5 h-3.5 text-amber-400" />
-              Export SVG
-            </button>
-            <button
-              onClick={handleExportPng}
-              className="px-3 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-neutral-950 text-xs font-semibold flex items-center gap-1.5 shadow-lg shadow-amber-500/20 transition"
-            >
-              <ImageIcon className="w-3.5 h-3.5" />
-              Export PNG
-            </button>
-          </div>
-        </div>
-
-        {/* Interactive SVG Canvas */}
-        <svg
-          ref={svgRef}
-          onMouseMove={handleMouseMove}
-          onMouseDown={handleMouseDown}
-          onMouseUp={handleMouseUp}
-          onClick={handleCanvasClick}
-          onContextMenu={handleContextMenu}
-          onWheel={handleWheel}
-          style={{ backgroundColor: theme.canvasBg }}
-          className={`w-full h-full flex-1 transition-colors duration-200 ${
-            isPanning
-              ? 'cursor-grabbing'
-              : isShiftHeld || toolMode === 'erase'
-                ? 'cursor-pointer'
-                : 'cursor-crosshair'
-          }`}
-        >
-          <g
-            transform={`translate(${
-              (svgRef.current?.clientWidth ?? window.innerWidth - 600) * 0.5
-            }, ${
-              (svgRef.current?.clientHeight ?? window.innerHeight) * 0.5
-            }) scale(${zoom}) translate(${pan.x}, ${pan.y})`}
-          >
-            {/* 1. Isometric Lattice Grid */}
-            {showGrid && (
-              <g className="pointer-events-none">
-                {backgroundGridLines.map((line) => (
-                  <line
-                    key={line.key}
-                    x1={line.p1.x}
-                    y1={line.p1.y}
-                    x2={line.p2.x}
-                    y2={line.p2.y}
-                    stroke={theme.gridLine}
-                    strokeWidth={0.75}
-                    strokeOpacity={0.55}
-                  />
-                ))}
-              </g>
-            )}
-
-            {/* 2A. STANDARD ISOMETRIC LOCK MODE (Merged Escher Ribbons) */}
-            {Math.abs(peekAmount) <= 0.01 && (
-              <>
-                {/* Filled Triangles */}
-                <g>
-                  {scene.triangles.map((tri) => {
-                    const fill =
-                      tri.faceType === 'X'
-                        ? theme.faceX
-                        : tri.faceType === 'Y'
-                          ? theme.faceY
-                          : theme.faceZ;
-                    const isHoveredErase =
-                      toolMode === 'erase' && hoveredBlockId === tri.blockId;
-                    const isHoveredShiftWeld =
-                      isShiftHeld && hoveredBlockId === tri.blockId;
+            <div className="flex-1 overflow-y-auto px-3 pb-3 space-y-2">
+              {menuSection === 'starters' && (
+                <>
+                  {SHAPE_PRESETS.map((preset) => {
+                    const isSelected = activePresetId === preset.id;
                     return (
-                      <polygon
-                        key={tri.key}
-                        points={pointsToSvgPolygon(tri.points)}
-                        fill={isHoveredErase ? '#f43f5e' : fill}
-                        stroke={
-                          isHoveredErase
-                            ? '#f43f5e'
-                            : isHoveredShiftWeld
-                              ? '#06b6d4'
-                              : fill
-                        }
-                        strokeWidth={isHoveredShiftWeld ? 1.8 : 0.65}
-                        strokeLinejoin="round"
-                        onMouseEnter={() => setHoveredBlockId(tri.blockId)}
-                        onClick={(e) => {
-                          if (e.shiftKey) {
-                            e.stopPropagation();
-                            handleToggleBlockWeldPlane(tri.blockId, clientToWorld(e.clientX, e.clientY));
-                          }
-                        }}
-                      />
+                      <button
+                        key={preset.id}
+                        onClick={() => handleLoadPreset(preset)}
+                        className={`w-full text-left px-3 py-3 rounded-xl border transition flex items-center justify-between ${
+                          isSelected
+                            ? 'bg-amber-500/15 border-amber-500/50 text-white'
+                            : 'bg-neutral-950/60 border-neutral-800 text-neutral-300 hover:bg-neutral-800/60 hover:text-white'
+                        }`}
+                      >
+                        <div>
+                          <div className="text-sm font-semibold">{preset.name}</div>
+                          <div className="text-xs text-neutral-400">{preset.subtitle}</div>
+                        </div>
+                        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-neutral-900 text-neutral-400 border border-neutral-800">
+                          {preset.blocks.length}b
+                        </span>
+                      </button>
                     );
                   })}
-                </g>
-
-                {/* Optional Internal Voxel Seams */}
-                {showVoxelSeams && (
-                  <g className="pointer-events-none">
-                    {scene.seamEdges.map((edge) => (
-                      <line
-                        key={edge.key}
-                        x1={edge.p1.x}
-                        y1={edge.p1.y}
-                        x2={edge.p2.x}
-                        y2={edge.p2.y}
-                        stroke={theme.stroke}
-                        strokeWidth={strokeWidth * 0.45}
-                        strokeOpacity={0.4}
-                        strokeDasharray="4 4"
-                        strokeLinecap="round"
-                      />
-                    ))}
-                  </g>
-                )}
-
-                {/* Crisp Merged Contour & Crease Outlines */}
-                <g className="pointer-events-none">
-                  {scene.edges.map((edge) => (
-                    <line
-                      key={edge.key}
-                      x1={edge.p1.x}
-                      y1={edge.p1.y}
-                      x2={edge.p2.x}
-                      y2={edge.p2.y}
-                      stroke={theme.stroke}
-                      strokeWidth={strokeWidth}
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    />
-                  ))}
-                </g>
-
-                {/* Selected Block Subtle Anchor Dot */}
-                {selectedBlockId && scene.blockScreenCenters.has(selectedBlockId) && (
-                  <circle
-                    cx={scene.blockScreenCenters.get(selectedBlockId)!.x}
-                    cy={scene.blockScreenCenters.get(selectedBlockId)!.y}
-                    r={4}
-                    fill="#f59e0b"
-                    stroke="#000"
-                    strokeWidth={1.5}
-                    className="pointer-events-none opacity-75"
-                  />
-                )}
-
-                {/* Shift-Hover: highlight the impossible joint that Shift+Click will toggle */}
-                {isShiftHeld && hoveredBlockId && (
-                  <g
-                    transform={`translate(${
-                      (activeJoint?.center ?? scene.blockScreenCenters.get(hoveredBlockId))?.x ?? 0
-                    }, ${(activeJoint?.center ?? scene.blockScreenCenters.get(hoveredBlockId))?.y ?? 0})`}
-                    className="pointer-events-none"
-                  >
-                    {activeJoint && (
-                      <circle r={9} fill="none" stroke="#06b6d4" strokeWidth={2.5} strokeDasharray="3 2" />
-                    )}
-                    <g transform="translate(0, -30)">
-                      <rect
-                        x={-104}
-                        y={-12}
-                        width={208}
-                        height={22}
-                        rx={11}
-                        fill="#09090b"
-                        fillOpacity={0.92}
-                        stroke="#06b6d4"
-                        strokeWidth={1.5}
-                      />
-                      <text
-                        x={0}
-                        y={3}
-                        textAnchor="middle"
-                        fill="#67e8f9"
-                        fontSize={10}
-                        fontWeight="bold"
-                      >
-                        {activeJoint
-                          ? `⇧+Click: ${WELD_PLANE_LABELS[activeJoint.plane]}`
-                          : 'No impossible joint here'}
-                      </text>
-                    </g>
-                  </g>
-                )}
-
-                {/* Ghost Block Preview in Build Mode */}
-                {ghostCandidate && (
-                  <g className="pointer-events-none">
-                    <polygon
-                      points={pointsToSvgPolygon(ghostCandidate.rhombuses.faceX)}
-                      fill={theme.faceX}
-                      fillOpacity={0.48}
-                      stroke={ghostCandidate.willEscherConnect ? '#f59e0b' : '#06b6d4'}
-                      strokeWidth={2.0}
-                      strokeDasharray={ghostCandidate.willEscherConnect ? undefined : '5 3'}
-                    />
-                    <polygon
-                      points={pointsToSvgPolygon(ghostCandidate.rhombuses.faceY)}
-                      fill={theme.faceY}
-                      fillOpacity={0.48}
-                      stroke={ghostCandidate.willEscherConnect ? '#f59e0b' : '#06b6d4'}
-                      strokeWidth={2.0}
-                      strokeDasharray={ghostCandidate.willEscherConnect ? undefined : '5 3'}
-                    />
-                    <polygon
-                      points={pointsToSvgPolygon(ghostCandidate.rhombuses.faceZ)}
-                      fill={theme.faceZ}
-                      fillOpacity={0.62}
-                      stroke={ghostCandidate.willEscherConnect ? '#f59e0b' : '#06b6d4'}
-                      strokeWidth={2.0}
-                      strokeDasharray={ghostCandidate.willEscherConnect ? undefined : '5 3'}
-                    />
-                    <g
-                      transform={`translate(${ghostCandidate.screenCenter.x}, ${
-                        ghostCandidate.screenCenter.y - 28
-                      })`}
-                    >
-                      <rect
-                        x={ghostCandidate.willEscherConnect ? -68 : -54}
-                        y={-12}
-                        width={ghostCandidate.willEscherConnect ? 136 : 108}
-                        height={22}
-                        rx={11}
-                        fill={ghostCandidate.willEscherConnect ? '#f59e0b' : '#09090b'}
-                        fillOpacity={0.9}
-                        stroke={ghostCandidate.willEscherConnect ? '#000' : '#06b6d4'}
-                        strokeWidth={1.5}
-                      />
-                      <text
-                        x={0}
-                        y={3}
-                        textAnchor="middle"
-                        fill={ghostCandidate.willEscherConnect ? '#09090b' : '#e0f2fe'}
-                        fontSize={10}
-                        fontWeight="bold"
-                      >
-                        {ghostCandidate.willEscherConnect
-                          ? '⚡ Escher Weld [Space]'
-                          : `Next ${ghostCandidate.direction ?? ''} [Space]`}
-                      </text>
-                    </g>
-                  </g>
-                )}
-
-                {/* Interactive Escher Connection Badges */}
-                {(showConnectionBadges || toolMode === 'connect') &&
-                  scene.connections.map((conn) => {
-                    const isNatural = conn.mode === 'natural';
-                    const isFlipped = conn.mode === 'flipped';
-                    const isDisconnected = conn.mode === 'disconnected';
-                    return (
-                      <g
-                        key={conn.id}
-                        transform={`translate(${conn.screenPos.x}, ${conn.screenPos.y})`}
-                        onClick={(e) => handleCycleConnection(conn, e)}
-                        className="cursor-pointer group"
-                      >
-                        <circle
-                          r={16}
-                          fill="transparent"
-                          className="group-hover:fill-amber-400/20 transition"
-                        />
-                        <circle
-                          r={10.5}
-                          fill={
-                            isDisconnected
-                              ? '#27272a'
-                              : isFlipped
-                                ? '#06b6d4'
-                                : '#f59e0b'
-                          }
-                          stroke="#09090b"
-                          strokeWidth={2}
-                        />
-                        <text
-                          x={0}
-                          y={3.5}
-                          textAnchor="middle"
-                          fontSize={10}
-                          fontWeight="bold"
-                          fill={isDisconnected ? '#a1a1aa' : '#09090b'}
-                        >
-                          {isDisconnected ? '×' : isFlipped ? '⇄' : '⚡'}
-                        </text>
-                      </g>
-                    );
-                  })}
-              </>
-            )}
-
-            {/* 2B. 3D ILLUSION PEEK MODE (Reveals true 3D depth separation & Escher tether lines) */}
-            {Math.abs(peekAmount) > 0.01 && (
-              <g>
-                {peekSortedBlocks.map(({ block, rhombuses, depth }) => (
-                  <g key={block.id}>
-                    <polygon
-                      points={pointsToSvgPolygon(rhombuses.faceX)}
-                      fill={theme.faceX}
-                      stroke={theme.stroke}
-                      strokeWidth={1.8}
-                      strokeLinejoin="round"
-                    />
-                    <polygon
-                      points={pointsToSvgPolygon(rhombuses.faceY)}
-                      fill={theme.faceY}
-                      stroke={theme.stroke}
-                      strokeWidth={1.8}
-                      strokeLinejoin="round"
-                    />
-                    <polygon
-                      points={pointsToSvgPolygon(rhombuses.faceZ)}
-                      fill={theme.faceZ}
-                      stroke={theme.stroke}
-                      strokeWidth={1.8}
-                      strokeLinejoin="round"
-                    />
-                    <text
-                      x={rhombuses.faceZ[0].x}
-                      y={rhombuses.faceZ[0].y - 6}
-                      textAnchor="middle"
-                      fontSize={9}
-                      fontWeight="bold"
-                      fill="#f59e0b"
-                    >
-                      d={depth}
-                    </text>
-                  </g>
-                ))}
-
-                {/* Dashed Tether Lines showing the 3D gap bridged by each Escher Connection */}
-                {scene.connections.map((conn) => {
-                  const bA = peekSortedBlocks.find((x) => x.block.id === conn.blockAId);
-                  const bB = peekSortedBlocks.find((x) => x.block.id === conn.blockBId);
-                  if (!bA || !bB) return null;
-                  return (
-                    <g key={`tether_${conn.id}`}>
-                      <line
-                        x1={bA.center.x}
-                        y1={bA.center.y}
-                        x2={bB.center.x}
-                        y2={bB.center.y}
-                        stroke="#f59e0b"
-                        strokeWidth={2.5}
-                        strokeDasharray="6 4"
-                      />
-                      <circle cx={bA.center.x} cy={bA.center.y} r={5} fill="#f59e0b" />
-                      <circle cx={bB.center.x} cy={bB.center.y} r={5} fill="#06b6d4" />
-                    </g>
-                  );
-                })}
-              </g>
-            )}
-          </g>
-        </svg>
-
-        {/* Bottom Floating Viewport Controls (Zoom, Fit, 3D Illusion Peek Slider) */}
-        <div className="absolute bottom-4 left-4 right-4 flex items-center justify-between pointer-events-none z-10">
-          {/* Zoom & Center Controls */}
-          <div className="pointer-events-auto flex items-center gap-1 p-1 rounded-xl bg-neutral-900/90 backdrop-blur-md border border-neutral-800 shadow-lg">
-            <button
-              onClick={() => setZoom((z) => Math.max(0.35, z * 0.85))}
-              className="p-2 rounded-lg text-neutral-300 hover:text-white hover:bg-neutral-800 transition"
-              title="Zoom Out"
-            >
-              <ZoomOut className="w-4 h-4" />
-            </button>
-            <span className="px-2 text-xs font-mono text-neutral-300 min-w-[52px] text-center">
-              {Math.round(zoom * 100)}%
-            </span>
-            <button
-              onClick={() => setZoom((z) => Math.min(3.0, z * 1.15))}
-              className="p-2 rounded-lg text-neutral-300 hover:text-white hover:bg-neutral-800 transition"
-              title="Zoom In"
-            >
-              <ZoomIn className="w-4 h-4" />
-            </button>
-            <div className="w-px h-4 bg-neutral-800 mx-0.5" />
-            <button
-              onClick={() => {
-                setZoom(1.05);
-                centerViewOnBlocks(blocks);
-              }}
-              className="px-2.5 py-1.5 rounded-lg text-xs font-medium text-neutral-300 hover:text-white hover:bg-neutral-800 flex items-center gap-1 transition"
-              title="Center View"
-            >
-              <Maximize2 className="w-3.5 h-3.5" />
-              Center
-            </button>
-          </div>
-
-          {/* 3D Illusion Peek Slider ("Break the Illusion" Inspector) */}
-          <div className="pointer-events-auto flex items-center gap-3 px-4 py-2 rounded-xl bg-neutral-900/95 backdrop-blur-md border border-neutral-800 shadow-lg">
-            <div className="flex items-center gap-1.5">
-              <Eye className="w-4 h-4 text-amber-400" />
-              <span className="text-xs font-semibold text-neutral-200">
-                Inspect 3D Depth Illusion:
-              </span>
-            </div>
-            <input
-              type="range"
-              min={-1}
-              max={1}
-              step={0.02}
-              value={peekAmount}
-              onChange={(e) => setPeekAmount(parseFloat(e.target.value))}
-              className="w-32 accent-amber-500 cursor-pointer"
-            />
-            {Math.abs(peekAmount) > 0.01 ? (
-              <button
-                onClick={() => setPeekAmount(0)}
-                className="px-2.5 py-1 rounded-lg bg-amber-500 text-neutral-950 text-xs font-bold hover:bg-amber-400 transition"
-              >
-                Lock Isometric
-              </button>
-            ) : (
-              <span className="text-[11px] font-mono text-emerald-400">
-                Isometric Locked
-              </span>
-            )}
-          </div>
-        </div>
-      </main>
-
-      {/* RIGHT SIDEBAR: Style, Orientation & Active Escher Connections Inspector */}
-      <aside className="w-72 flex-shrink-0 border-l border-neutral-800/80 bg-neutral-900/90 backdrop-blur-md flex flex-col justify-between z-20 overflow-y-auto">
-        <div className="p-4 space-y-5">
-          {/* Isometric Projection Orientation */}
-          <div>
-            <div className="text-[11px] font-semibold uppercase tracking-wider text-neutral-400 mb-2">
-              Isometric Axis Orientation
-            </div>
-            <div className="grid grid-cols-2 gap-1.5 p-1 bg-neutral-950 rounded-xl border border-neutral-800">
-              <button
-                onClick={() => {
-                  setOrientation('penrose-horizontal');
-                  centerViewOnBlocks(blocks, 'penrose-horizontal');
-                }}
-                className={`py-2 px-2.5 rounded-lg text-xs font-medium transition ${
-                  orientation === 'penrose-horizontal'
-                    ? 'bg-neutral-800 text-white shadow font-semibold border border-neutral-700'
-                    : 'text-neutral-400 hover:text-white'
-                }`}
-              >
-                Penrose (0°/60°)
-              </button>
-              <button
-                onClick={() => {
-                  setOrientation('isometric-vertical');
-                  centerViewOnBlocks(blocks, 'isometric-vertical');
-                }}
-                className={`py-2 px-2.5 rounded-lg text-xs font-medium transition ${
-                  orientation === 'isometric-vertical'
-                    ? 'bg-neutral-800 text-white shadow font-semibold border border-neutral-700'
-                    : 'text-neutral-400 hover:text-white'
-                }`}
-              >
-                Vertical (30°/90°)
-              </button>
-            </div>
-          </div>
-
-          {/* Display Toggles */}
-          <div className="space-y-2">
-            <div className="text-[11px] font-semibold uppercase tracking-wider text-neutral-400">
-              Rendering & Overlays
-            </div>
-
-            <button
-              onClick={() => setShowVoxelSeams((s) => !s)}
-              className="w-full px-3 py-2 rounded-xl bg-neutral-950/70 hover:bg-neutral-950 border border-neutral-800 flex items-center justify-between text-xs transition"
-            >
-              <span className="flex items-center gap-2 text-neutral-200">
-                <Box className="w-3.5 h-3.5 text-amber-400" />
-                Show Voxel Block Seams
-              </span>
-              <span
-                className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${
-                  showVoxelSeams
-                    ? 'bg-amber-500/20 text-amber-300'
-                    : 'bg-neutral-800 text-neutral-400'
-                }`}
-              >
-                {showVoxelSeams ? 'ON' : 'MERGED'}
-              </span>
-            </button>
-
-            <button
-              onClick={() => setShowGrid((g) => !g)}
-              className="w-full px-3 py-2 rounded-xl bg-neutral-950/70 hover:bg-neutral-950 border border-neutral-800 flex items-center justify-between text-xs transition"
-            >
-              <span className="flex items-center gap-2 text-neutral-200">
-                <Grid className="w-3.5 h-3.5 text-cyan-400" />
-                Isometric Guide Grid
-              </span>
-              <span
-                className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${
-                  showGrid
-                    ? 'bg-cyan-500/20 text-cyan-300'
-                    : 'bg-neutral-800 text-neutral-400'
-                }`}
-              >
-                {showGrid ? 'ON' : 'OFF'}
-              </span>
-            </button>
-
-            <button
-              onClick={() => setShowConnectionBadges((b) => !b)}
-              className="w-full px-3 py-2 rounded-xl bg-neutral-950/70 hover:bg-neutral-950 border border-neutral-800 flex items-center justify-between text-xs transition"
-            >
-              <span className="flex items-center gap-2 text-neutral-200">
-                <Zap className="w-3.5 h-3.5 text-amber-400" />
-                Show ⚡ Weld Badges
-              </span>
-              <span
-                className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${
-                  showConnectionBadges
-                    ? 'bg-amber-500/20 text-amber-300'
-                    : 'bg-neutral-800 text-neutral-400'
-                }`}
-              >
-                {showConnectionBadges ? 'VISIBLE' : 'HIDDEN'}
-              </span>
-            </button>
-
-            {/* Outline Thickness */}
-            <div className="p-3 rounded-xl bg-neutral-950/70 border border-neutral-800 space-y-1.5">
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-neutral-300">Line Art Stroke Weight</span>
-                <span className="font-mono text-neutral-400">{strokeWidth.toFixed(1)}px</span>
-              </div>
-              <input
-                type="range"
-                min={1.0}
-                max={4.5}
-                step={0.2}
-                value={strokeWidth}
-                onChange={(e) => setStrokeWidth(parseFloat(e.target.value))}
-                className="w-full accent-amber-500 cursor-pointer"
-              />
-            </div>
-          </div>
-
-          {/* Color Themes */}
-          <div>
-            <div className="text-[11px] font-semibold uppercase tracking-wider text-neutral-400 mb-2 flex items-center gap-1.5">
-              <Palette className="w-3.5 h-3.5 text-amber-400" />
-              Shading Palette
-            </div>
-            <div className="space-y-1.5">
-              {COLOR_THEMES.map((t) => {
-                const active = theme.id === t.id;
-                return (
-                  <button
-                    key={t.id}
-                    onClick={() => setTheme(t)}
-                    className={`w-full px-3 py-2 rounded-xl border text-left transition flex items-center justify-between ${
-                      active
-                        ? 'bg-neutral-800 border-amber-500/50 text-white'
-                        : 'bg-neutral-950/60 border-neutral-800 text-neutral-300 hover:bg-neutral-800/50'
-                    }`}
-                  >
-                    <span className="text-xs font-medium">{t.name}</span>
-                    <div className="flex items-center gap-1">
-                      <span
-                        className="w-3.5 h-3.5 rounded-full border border-neutral-600"
-                        style={{ backgroundColor: t.faceZ }}
-                      />
-                      <span
-                        className="w-3.5 h-3.5 rounded-full border border-neutral-600"
-                        style={{ backgroundColor: t.faceX }}
-                      />
-                      <span
-                        className="w-3.5 h-3.5 rounded-full border border-neutral-600"
-                        style={{ backgroundColor: t.faceY }}
-                      />
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* Active Escher Connections List */}
-          <div>
-            <div className="text-[11px] font-semibold uppercase tracking-wider text-neutral-400 mb-2 flex items-center justify-between">
-              <span>Impossible Connections</span>
-              <span className="font-mono text-amber-400">{scene.connections.length}</span>
-            </div>
-            {scene.connections.length === 0 ? (
-              <div className="p-3 rounded-xl bg-neutral-950/50 border border-neutral-800/80 text-xs text-neutral-400 leading-relaxed">
-                No impossible connections yet. Build a 3-axis loop (extend along X, Y, and Z) until
-                two ends visually meet!
-              </div>
-            ) : (
-              <div className="space-y-1.5">
-                {scene.connections.map((conn, idx) => (
-                  <div
-                    key={conn.id}
-                    className="p-2.5 rounded-xl bg-neutral-950/80 border border-neutral-800 flex items-center justify-between gap-2"
-                  >
-                    <div>
-                      <div className="text-xs font-semibold text-neutral-200 flex items-center gap-1.5">
-                        <span className="text-amber-400">#{idx + 1}</span>
-                        <span>
-                          {conn.kind === 'adjacent'
-                            ? `${conn.direction} Escher Weld`
-                            : 'Beam Crossing'}
-                        </span>
-                      </div>
-                      <div className="text-[10px] text-neutral-400 font-mono">
-                        Depth gap: Δk = {conn.depthGap} ·{' '}
-                        <span
-                          className={
-                            conn.mode === 'natural'
-                              ? 'text-amber-300'
-                              : conn.mode === 'flipped'
-                                ? 'text-cyan-300'
-                                : 'text-neutral-500'
-                          }
-                        >
-                          {conn.mode.toUpperCase()}
-                        </span>
-                      </div>
-                    </div>
+                  <div className="pt-1">
                     <button
-                      onClick={() => handleCycleConnection(conn)}
-                      className="px-2.5 py-1.5 rounded-lg bg-neutral-900 hover:bg-neutral-800 border border-neutral-700 text-xs font-medium text-neutral-200 flex items-center gap-1 transition"
-                      title="Cycle connection mode (Natural -> Flipped -> Disconnected)"
+                      onClick={loadEmptyCanvas}
+                      className="w-full py-3 rounded-xl bg-neutral-950/60 border border-neutral-800 text-xs font-medium text-neutral-300 hover:text-rose-300 hover:border-rose-500/40 flex items-center justify-center gap-1.5"
                     >
-                      {conn.mode === 'disconnected' ? (
-                        <>
-                          <Unlink2 className="w-3.5 h-3.5 text-neutral-400" />
-                          <span>Off</span>
-                        </>
-                      ) : conn.mode === 'flipped' ? (
-                        <>
-                          <FlipHorizontal2 className="w-3.5 h-3.5 text-cyan-400" />
-                          <span>Flip</span>
-                        </>
-                      ) : (
-                        <>
-                          <Link2 className="w-3.5 h-3.5 text-amber-400" />
-                          <span>Weld</span>
-                        </>
-                      )}
+                      <Trash2 className="w-3.5 h-3.5" />
+                      Empty Canvas
                     </button>
                   </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
+                </>
+              )}
 
-        {/* Right Sidebar Footer: Offer a Suggestion */}
-        <div className="p-3 border-t border-neutral-800 bg-neutral-950/60">
-          <button
-            onClick={handleOpenSuggestionModal}
-            className="w-full py-2.5 px-3 rounded-xl bg-gradient-to-r from-cyan-500/20 to-amber-500/20 hover:from-cyan-500/30 hover:to-amber-500/30 border border-cyan-500/40 text-xs font-semibold text-cyan-200 hover:text-white flex items-center justify-center gap-2 shadow-md transition"
-          >
-            <MessageSquarePlus className="w-4 h-4 text-cyan-400" />
-            <span>Offer a Suggestion to Improve This</span>
-          </button>
+              {menuSection === 'settings' && (
+                <>
+                  <ToggleRow
+                    label="Auto-connect impossible joints"
+                    description="Blocks that visually touch fuse into an Escher weld"
+                    value={autoConnect}
+                    onChange={setAutoConnect}
+                  />
+                  <ToggleRow label="Show voxel block seams" value={showVoxelSeams} onChange={setShowVoxelSeams} />
+                  <ToggleRow label="Isometric guide grid" value={showGrid} onChange={setShowGrid} />
+                  <ToggleRow label="Show weld badges" value={showConnectionBadges} onChange={setShowConnectionBadges} />
+
+                  <div className="pt-2">
+                    <div className="text-[11px] font-semibold uppercase tracking-wider text-neutral-400 mb-1.5">
+                      Orientation
+                    </div>
+                    <div className="grid grid-cols-2 gap-1 p-1 bg-neutral-950 rounded-xl border border-neutral-800">
+                      {(
+                        [
+                          { id: 'penrose-horizontal', label: 'Penrose' },
+                          { id: 'isometric-vertical', label: 'Vertical' },
+                        ] as const
+                      ).map((o) => (
+                        <button
+                          key={o.id}
+                          onClick={() => {
+                            setOrientation(o.id);
+                            centerViewOnBlocks(blocks, o.id);
+                          }}
+                          className={`py-2 rounded-lg text-xs font-medium transition ${
+                            orientation === o.id
+                              ? 'bg-neutral-800 text-white border border-neutral-700 font-semibold'
+                              : 'text-neutral-400 hover:text-white'
+                          }`}
+                        >
+                          {o.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="pt-2 space-y-1.5">
+                    <div className="flex items-center justify-between text-[11px] font-semibold uppercase tracking-wider text-neutral-400">
+                      <span>Line weight</span>
+                      <span className="font-mono normal-case">{strokeWidth.toFixed(1)}px</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={1.0}
+                      max={4.5}
+                      step={0.2}
+                      value={strokeWidth}
+                      onChange={(e) => setStrokeWidth(parseFloat(e.target.value))}
+                      className="w-full accent-amber-500 cursor-pointer"
+                    />
+                  </div>
+
+                  <div className="pt-2">
+                    <div className="text-[11px] font-semibold uppercase tracking-wider text-neutral-400 mb-1.5 flex items-center gap-1.5">
+                      <Palette className="w-3.5 h-3.5 text-amber-400" />
+                      Shading palette
+                    </div>
+                    <div className="space-y-1.5">
+                      {COLOR_THEMES.map((t) => {
+                        const active = theme.id === t.id;
+                        return (
+                          <button
+                            key={t.id}
+                            onClick={() => setTheme(t)}
+                            className={`w-full px-3 py-2.5 rounded-xl border text-left transition flex items-center justify-between ${
+                              active
+                                ? 'bg-neutral-800 border-amber-500/50 text-white'
+                                : 'bg-neutral-950/60 border-neutral-800 text-neutral-300 hover:bg-neutral-800/50'
+                            }`}
+                          >
+                            <span className="text-xs font-medium">{t.name}</span>
+                            <div className="flex items-center gap-1">
+                              {[t.faceZ, t.faceX, t.faceY].map((c, i) => (
+                                <span
+                                  key={i}
+                                  className="w-3.5 h-3.5 rounded-full border border-neutral-600"
+                                  style={{ backgroundColor: c }}
+                                />
+                              ))}
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {menuSection === 'export' && (
+                <>
+                  <button
+                    onClick={() => {
+                      handleExportSvg();
+                      setMenuOpen(false);
+                    }}
+                    className="w-full px-3 py-3 rounded-xl bg-neutral-950/60 border border-neutral-800 text-sm font-medium text-neutral-200 hover:bg-neutral-800 flex items-center gap-2.5"
+                  >
+                    <Download className="w-4 h-4 text-amber-400" />
+                    Export SVG
+                  </button>
+                  <button
+                    onClick={() => {
+                      handleExportPng();
+                      setMenuOpen(false);
+                    }}
+                    className="w-full px-3 py-3 rounded-xl bg-neutral-950/60 border border-neutral-800 text-sm font-medium text-neutral-200 hover:bg-neutral-800 flex items-center gap-2.5"
+                  >
+                    <ImageIcon className="w-4 h-4 text-amber-400" />
+                    Export PNG
+                  </button>
+                </>
+              )}
+            </div>
+
+            {/* Footer: Suggestion + Help */}
+            <div className="p-3 border-t border-neutral-800 space-y-2">
+              <button
+                onClick={() => {
+                  setMenuOpen(false);
+                  handleOpenSuggestionModal();
+                }}
+                className="w-full py-3 px-3 rounded-xl bg-gradient-to-r from-cyan-500/20 to-amber-500/20 border border-cyan-500/40 text-xs font-semibold text-cyan-200 hover:text-white flex items-center justify-center gap-2"
+              >
+                <MessageSquarePlus className="w-4 h-4 text-cyan-400" />
+                Offer a Suggestion to Improve This
+              </button>
+              <button
+                onClick={() => {
+                  setMenuOpen(false);
+                  setShowHelpModal(true);
+                }}
+                className="w-full py-2.5 px-3 rounded-xl text-xs font-medium text-neutral-400 hover:text-white hover:bg-neutral-800 flex items-center justify-center gap-2"
+              >
+                <HelpCircle className="w-4 h-4" />
+                How it works
+              </button>
+            </div>
+          </aside>
         </div>
-      </aside>
+      )}
 
       {/* OFFER A SUGGESTION (GITHUB ISSUE) MODAL */}
       {showSuggestionModal && (
@@ -2353,10 +2151,9 @@ export default function App() {
                 <strong>exact same 2D screen position</strong>.
               </p>
               <p>
-                <strong>1. Building in 3D:</strong> Hover near any existing block to preview a new
-                block along any of its 6 isometric directions (
-                <code className="text-amber-300 font-mono">+X, -X, +Y, -Y, +Z, -Z</code>), or use
-                the <strong>3D Axis Step Builder</strong> pad in the left sidebar.
+                <strong>1. Building in 3D:</strong> Tap or click near any block to add a neighbor,
+                or use the arrow keys / on-screen D-pad to move the next block and Space / the
+                center button to place it.
               </p>
               <p>
                 <strong>2. Automatic Escher Welds (⚡):</strong> Whenever a newly placed block
@@ -2365,13 +2162,13 @@ export default function App() {
                 to create seamless M.C. Escher &amp; Penrose illusions.
               </p>
               <p>
-                <strong>3. Flip or Break the Illusion:</strong> Click any{' '}
-                <span className="text-amber-400 font-semibold">⚡ weld badge</span> on the canvas to
-                flip which beam passes in front or unmerge the joint, or{' '}
+                <strong>3. Flip or Break the Illusion:</strong> Turn on weld badges in Settings and
+                click any{' '}
+                <span className="text-amber-400 font-semibold">⚡ badge</span> to flip which beam
+                passes in front or unmerge the joint, or{' '}
                 <span className="text-cyan-300 font-semibold">Shift + Click</span> any block to
-                change which face plane welds. Drag the{' '}
-                <strong>Inspect 3D Depth Illusion</strong> slider at the bottom to tilt the camera
-                and see the secret 3D depth gap!
+                change which face plane welds at an impossible joint (or use the Toggle Weld
+                button for the last block you added).
               </p>
             </div>
             <div className="pt-2 flex justify-end">
