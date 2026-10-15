@@ -60,6 +60,7 @@ import {
   X,
   Settings,
   ArrowUp,
+  Minus,
 } from 'lucide-react';
 
 interface HistorySnapshot {
@@ -518,10 +519,55 @@ export default function App() {
     ]
   );
 
+  // Erase mode: arrows / D-pad move a red cursor between EXISTING blocks.
+  // Prefers the block exactly one lattice step in that direction, otherwise the nearest
+  // block roughly in that on-screen direction (within ±55°).
+  const moveEraseCursor = useCallback(
+    (dir: AxisDirection) => {
+      const current = blocks.find((b) => b.id === selectedBlockId) ?? blocks[blocks.length - 1];
+      if (!current) return;
+      const d = AXIS_DELTAS[dir];
+      const cl = blockToLattice(current.x, current.y, current.z);
+
+      let target = blocks.find((b) => {
+        if (b.id === current.id) return false;
+        const lc = blockToLattice(b.x, b.y, b.z);
+        return lc.u === cl.u + d.du && lc.v === cl.v + d.dv;
+      });
+
+      if (!target) {
+        const dv = latticeToScreen(d.du, d.dv, orientation, 1);
+        const dLen = Math.hypot(dv.x, dv.y) || 1;
+        let bestScore = Infinity;
+        for (const b of blocks) {
+          if (b.id === current.id) continue;
+          const lc = blockToLattice(b.x, b.y, b.z);
+          const off = latticeToScreen(lc.u - cl.u, lc.v - cl.v, orientation, 1);
+          const dist = Math.hypot(off.x, off.y);
+          if (dist === 0) continue;
+          const cos = (off.x * dv.x + off.y * dv.y) / (dist * dLen);
+          if (cos < 0.57) continue;
+          const score = dist * (2 - cos);
+          if (score < bestScore) {
+            bestScore = score;
+            target = b;
+          }
+        }
+      }
+
+      if (target) setSelectedBlockId(target.id);
+    },
+    [blocks, selectedBlockId, orientation]
+  );
+
   // Move the "Next Block" ghost cursor using Arrow keys (or Q/E)
   const moveNextBlockCursor = useCallback(
     (dir: AxisDirection) => {
-      setToolMode('build');
+      if (toolMode === 'erase') {
+        setLastBuildDir(dir);
+        moveEraseCursor(dir);
+        return;
+      }
       setInputMode('keyboard');
       setLastBuildDir(dir);
 
@@ -573,7 +619,7 @@ export default function App() {
         };
       });
     },
-    [blocks, selectedBlockId]
+    [blocks, selectedBlockId, toolMode, moveEraseCursor]
   );
 
   // Step-extrude from the currently selected (or last) block along one of the 6 isometric directions
@@ -632,6 +678,45 @@ export default function App() {
       commitChange,
       syncKbGhostFromBlock,
     ]
+  );
+
+  // Erase mode: delete the block under the red cursor, then move the cursor to the nearest block
+  const deleteEraseTarget = useCallback(() => {
+    const target = blocks.find((b) => b.id === selectedBlockId) ?? blocks[blocks.length - 1];
+    if (!target) return;
+    const tl = blockToLattice(target.x, target.y, target.z);
+    let next: VoxelBlock | undefined;
+    let best = Infinity;
+    for (const b of blocks) {
+      if (b.id === target.id) continue;
+      const lc = blockToLattice(b.x, b.y, b.z);
+      const off = latticeToScreen(lc.u - tl.u, lc.v - tl.v, orientation, 1);
+      const dist = Math.hypot(off.x, off.y);
+      if (dist < best) {
+        best = dist;
+        next = b;
+      }
+    }
+    removeBlockById(target.id);
+    setSelectedBlockId(next?.id ?? null);
+    syncKbGhostFromBlock(next, lastBuildDir);
+  }, [blocks, selectedBlockId, orientation, removeBlockById, syncKbGhostFromBlock, lastBuildDir]);
+
+  // Switch tools. Build mode resumes from the block the cursor was on.
+  const switchTool = useCallback(
+    (mode: ToolMode) => {
+      setToolMode(mode);
+      if (mode === 'erase') {
+        if (!blocks.some((b) => b.id === selectedBlockId)) {
+          setSelectedBlockId(blocks[blocks.length - 1]?.id ?? null);
+        }
+        setLastWeldBanner(isTouch ? 'Erase: use the arrows to pick a block, then press −' : 'Erase: arrows pick a block, Space/Delete removes it (or click a block)');
+      } else {
+        const anchor = blocks.find((b) => b.id === selectedBlockId) ?? blocks[blocks.length - 1];
+        syncKbGhostFromBlock(anchor, lastBuildDir);
+      }
+    },
+    [blocks, selectedBlockId, isTouch, syncKbGhostFromBlock, lastBuildDir]
   );
 
   // Shift+Click (or 'W' key): Toggle which face/plane welds in front at the nearest impossible joint
@@ -806,7 +891,11 @@ export default function App() {
 
     if (toolMode === 'erase') {
       if (hitBlockId) {
-        removeBlockById(hitBlockId);
+        if (isTouch) {
+          setSelectedBlockId(hitBlockId); // pick it; the − button deletes
+        } else {
+          removeBlockById(hitBlockId);
+        }
       }
       return;
     }
@@ -963,6 +1052,10 @@ export default function App() {
       // Spacebar places the block at the current ghost position
       if (e.code === 'Space' || e.key === ' ') {
         e.preventDefault();
+        if (toolMode === 'erase') {
+          deleteEraseTarget();
+          return;
+        }
         setToolMode('build');
         setInputMode('keyboard');
         if (ghostCandidate) {
@@ -976,12 +1069,14 @@ export default function App() {
         return;
       }
 
-      if (e.key === '1') setToolMode('build');
-      if (e.key === '2') setToolMode('erase');
+      if (e.key === '1') switchTool('build');
+      if (e.key === '2') switchTool('erase');
       if (e.key.toLowerCase() === 'g') setShowGrid((g) => !g);
       if (e.key.toLowerCase() === 'v') setShowVoxelSeams((v) => !v);
       if (e.key === 'Backspace' || e.key === 'Delete') {
-        if (selectedBlockId && blocks.length > 0) {
+        if (toolMode === 'erase') {
+          deleteEraseTarget();
+        } else if (selectedBlockId && blocks.length > 0) {
           removeBlockById(selectedBlockId);
         }
       }
@@ -1011,6 +1106,9 @@ export default function App() {
     selectedBlockId,
     blocks.length,
     removeBlockById,
+    toolMode,
+    deleteEraseTarget,
+    switchTool,
   ]);
 
   // Generate clean standalone SVG string for export
@@ -1428,6 +1526,31 @@ export default function App() {
             ))}
           </g>
 
+          {/* Erase mode: red indicator on the block that − / Delete will remove */}
+          {toolMode === 'erase' &&
+            (() => {
+              const target = blocks.find((b) => b.id === selectedBlockId) ?? blocks[blocks.length - 1];
+              if (!target) return null;
+              const lc = blockToLattice(target.x, target.y, target.z);
+              const r = getBlockRhombuses(lc.u, lc.v, orientation, BASE_SCALE);
+              return (
+                <g className="pointer-events-none">
+                  {[r.faceX, r.faceY, r.faceZ].map((pts, i) => (
+                    <polygon
+                      key={i}
+                      points={pointsToSvgPolygon(pts)}
+                      fill="#f43f5e"
+                      fillOpacity={0.4}
+                      stroke="#f43f5e"
+                      strokeWidth={2.5}
+                      strokeDasharray="6 3"
+                      strokeLinejoin="round"
+                    />
+                  ))}
+                </g>
+              );
+            })()}
+
           {/* Selected Block Anchor Dot */}
           {selectedBlockId && scene.blockScreenCenters.has(selectedBlockId) && (
             <circle
@@ -1539,7 +1662,7 @@ export default function App() {
       {/* Weld toast */}
       {lastWeldBanner && (
         <div
-          className="absolute top-3 left-1/2 -translate-x-1/2 z-20 max-w-[70vw] px-3 py-2 rounded-xl bg-neutral-900/95 border border-cyan-500/40 text-cyan-200 text-xs font-medium shadow-lg pointer-events-none text-center"
+          className={`absolute ${isTouch ? 'top-[4.5rem]' : 'top-3'} left-1/2 -translate-x-1/2 z-20 max-w-[80vw] px-3 py-2 rounded-xl bg-neutral-900/95 border border-cyan-500/40 text-cyan-200 text-xs font-medium shadow-lg pointer-events-none text-center`}
           style={{ marginTop: 'env(safe-area-inset-top)' }}
         >
           {lastWeldBanner}
@@ -1586,7 +1709,7 @@ export default function App() {
       >
         <div className="flex p-1 rounded-xl bg-neutral-900/90 backdrop-blur-md border border-neutral-700/80 shadow-lg">
           <button
-            onClick={() => setToolMode('build')}
+            onClick={() => switchTool('build')}
             className={`h-10 px-3 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition ${
               toolMode === 'build' ? 'bg-amber-500 text-neutral-950' : 'text-neutral-300 hover:text-white'
             }`}
@@ -1595,7 +1718,7 @@ export default function App() {
             Add
           </button>
           <button
-            onClick={() => setToolMode('erase')}
+            onClick={() => switchTool('erase')}
             className={`h-10 px-3 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition ${
               toolMode === 'erase' ? 'bg-rose-500 text-white' : 'text-neutral-300 hover:text-white'
             }`}
@@ -1657,13 +1780,24 @@ export default function App() {
               </button>
             );
           })}
-          <button
-            onClick={placeKbBlock}
-            className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-14 h-14 rounded-full bg-amber-500 hover:bg-amber-400 active:scale-95 text-neutral-950 shadow-lg shadow-amber-500/30 flex items-center justify-center transition"
-            aria-label="Place block"
-          >
-            <Plus className="w-7 h-7 stroke-[3]" />
-          </button>
+          {toolMode === 'erase' ? (
+            <button
+              onClick={deleteEraseTarget}
+              disabled={blocks.length === 0}
+              className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-14 h-14 rounded-full bg-rose-500 hover:bg-rose-400 active:scale-95 text-white shadow-lg shadow-rose-500/30 flex items-center justify-center transition disabled:opacity-40"
+              aria-label="Delete selected block"
+            >
+              <Minus className="w-7 h-7 stroke-[3]" />
+            </button>
+          ) : (
+            <button
+              onClick={placeKbBlock}
+              className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-14 h-14 rounded-full bg-amber-500 hover:bg-amber-400 active:scale-95 text-neutral-950 shadow-lg shadow-amber-500/30 flex items-center justify-center transition"
+              aria-label="Place block"
+            >
+              <Plus className="w-7 h-7 stroke-[3]" />
+            </button>
+          )}
         </div>
       )}
 
