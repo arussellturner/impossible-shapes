@@ -8,8 +8,10 @@ An interactive 3D isometric voxel editor for designing **M.C. Escher** and **Pen
 2. **Automatic Escher Welds (`⚡`)**: When you place blocks in 3D that visually touch in the 2D isometric projection across a depth gap $\Delta k \neq 0$, the engine automatically creates an **Escher Weld**:
    - **Local Paradox Depth Weaving**: Uses shortest-path local virtual 3D offsets around each junction so cyclic loops (like the Penrose Triangle or Penrose Staircase) weave seamlessly without global depth conflicts.
    - **Coplanar Ribbon Merging**: Automatically hides internal voxel seams between connected coplanar faces ($\Delta F = 0$) and merges collinear contour/crease strokes into crisp vector line art.
+   - **Local Consistency Repair**: Impossible figures are still *locally* possible. Every lattice vertex is checked against a table of all patterns a real cube arrangement can produce (`src/engine/realizablePatterns.ts`); any vertex that fails (a stray triangle or notch) has its surrounding triangles re-picked to the closest valid look.
 3. **Interactive Controls**:
    - **Add Blocks**: Hover near any existing block face to preview and place blocks along all 6 isometric directions (`+X, -X, +Y, -Y, +Z, -Z`), or use the **3D Axis Step Builder** pad.
+   - **Welds Mode** (key `3`): A cyan cursor jumps between every weld joint you can toggle — use the arrow keys / D-pad (or `Tab` / `Shift+Tab`) to move it and `W` (or `Space` / `Enter`) to cycle which face welds in front. Clicking a weld selects it; clicking it again toggles it.
    - **Flip or Unmerge Welds**: Click any `⚡` badge on the canvas to cycle between **Natural Weld**, **Flipped Weave** (reversing which beam passes in front), and **Disconnected** (true 3D depth).
    - **Inspect 3D Depth Illusion**: Drag the **Inspect 3D Depth Illusion** slider to tilt the projection off the isometric axis and reveal the hidden 3D depth gaps bridged by each Escher weld.
    - **Export**: Download crisp **SVG** vector line art or **2× Retina PNG** renders.

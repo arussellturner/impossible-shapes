@@ -24,7 +24,9 @@ import {
   findWeldJointForBlock,
   getNextWeldJointToggle,
   latticeToScreen,
+  listToggleableJoints,
   resolveGhostAtLattice,
+  WeldJointToggle,
 } from './engine/isometricEngine';
 import { COLOR_THEMES, SHAPE_PRESETS } from './engine/presets';
 import {
@@ -68,6 +70,12 @@ interface HistorySnapshot {
   connectionModes: Record<string, ConnectionMode>;
   blockWeldOverrides: Record<string, BlockWeldOverride>;
 }
+
+const WELD_PLANE_SHORT: Record<'X' | 'Y' | 'Z', string> = {
+  X: 'Gray front',
+  Y: 'Black front',
+  Z: 'White front',
+};
 
 function pointsToSvgPolygon(pts: ScreenPoint[]): string {
   return pts.map((p) => `${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(' ');
@@ -199,6 +207,8 @@ export default function App() {
 
   // Selected / active block for keyboard or compass extrusion
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
+  // Welds mode: key of the weld joint under the cyan cursor
+  const [selectedJointKey, setSelectedJointKey] = useState<string | null>(null);
   const [isShiftHeld, setIsShiftHeld] = useState<boolean>(false);
   const [lastWeldBanner, setLastWeldBanner] = useState<string | null>(null);
 
@@ -326,6 +336,104 @@ export default function App() {
       ),
     [scene, hoveredBlockId, selectedBlockId, blocks, cursorWorld]
   );
+
+  // Welds mode: every joint whose toggle visibly changes the drawing (only computed in this mode)
+  const weldToggles: WeldJointToggle[] = useMemo(
+    () =>
+      toolMode === 'welds'
+        ? listToggleableJoints(blocks, connectionModes, blockWeldOverrides, orientation, scene)
+        : [],
+    [toolMode, blocks, connectionModes, blockWeldOverrides, orientation, scene]
+  );
+  const selectedToggle = useMemo(
+    () => weldToggles.find((t) => t.joint.key === selectedJointKey) ?? null,
+    [weldToggles, selectedJointKey]
+  );
+
+  // Keep a valid weld selected: if the current one disappears, jump to the nearest remaining weld
+  useEffect(() => {
+    if (toolMode !== 'welds' || weldToggles.length === 0 || selectedToggle) return;
+    const prev = scene.weldJoints.find((j) => j.key === selectedJointKey)?.center;
+    const ref =
+      prev ??
+      scene.blockScreenCenters.get(selectedBlockId ?? '') ??
+      scene.blockScreenCenters.get(blocks[blocks.length - 1]?.id ?? '');
+    let best = weldToggles[0];
+    if (ref) {
+      let bestD = Infinity;
+      for (const t of weldToggles) {
+        const d = (t.joint.center.x - ref.x) ** 2 + (t.joint.center.y - ref.y) ** 2;
+        if (d < bestD) {
+          bestD = d;
+          best = t;
+        }
+      }
+    }
+    setSelectedJointKey(best.joint.key);
+  }, [toolMode, weldToggles, selectedToggle, selectedJointKey, scene, selectedBlockId, blocks]);
+
+  // Welds mode: arrows / D-pad jump to the nearest toggleable weld roughly in that on-screen direction
+  const moveWeldCursor = useCallback(
+    (dir: AxisDirection) => {
+      if (weldToggles.length === 0) return;
+      const from = selectedToggle?.joint.center;
+      if (!from) {
+        setSelectedJointKey(weldToggles[0].joint.key);
+        return;
+      }
+      const d = AXIS_DELTAS[dir];
+      const dv = latticeToScreen(d.du, d.dv, orientation, 1);
+      const dLen = Math.hypot(dv.x, dv.y) || 1;
+      let target: WeldJointToggle | null = null;
+      let bestScore = Infinity;
+      for (const t of weldToggles) {
+        if (t === selectedToggle) continue;
+        const ox = t.joint.center.x - from.x;
+        const oy = t.joint.center.y - from.y;
+        const dist = Math.hypot(ox, oy);
+        if (dist < 1e-6) continue;
+        const cos = (ox * dv.x + oy * dv.y) / (dist * dLen);
+        if (cos < 0.5) continue; // within ±60° of the arrow direction
+        const score = dist * (2.2 - cos);
+        if (score < bestScore) {
+          bestScore = score;
+          target = t;
+        }
+      }
+      if (target) setSelectedJointKey(target.joint.key);
+      else setLastWeldBanner('No more welds that way');
+    },
+    [weldToggles, selectedToggle, orientation]
+  );
+
+  // Welds mode: Tab / Shift+Tab steps through welds in reading order (top-to-bottom, left-to-right)
+  const cycleWeldCursor = useCallback(
+    (step: 1 | -1) => {
+      if (weldToggles.length === 0) return;
+      const sorted = [...weldToggles].sort((a, b) =>
+        Math.abs(a.joint.center.y - b.joint.center.y) > 1
+          ? a.joint.center.y - b.joint.center.y
+          : a.joint.center.x - b.joint.center.x
+      );
+      const idx = sorted.findIndex((t) => t.joint.key === selectedJointKey);
+      const next = sorted[(idx + step + sorted.length) % sorted.length];
+      setSelectedJointKey(next.joint.key);
+    },
+    [weldToggles, selectedJointKey]
+  );
+
+  // Welds mode: cycle the selected weld to its next visibly distinct plane
+  const toggleSelectedWeld = useCallback(() => {
+    if (!selectedToggle) {
+      setLastWeldBanner(weldToggles.length ? 'Pick a weld first' : 'No toggleable welds in this shape');
+      return;
+    }
+    commitChange(blocks, connectionModes, {
+      ...blockWeldOverrides,
+      [selectedToggle.jointKey]: { plane: selectedToggle.nextPlane, order: selectedToggle.nextOrder },
+    });
+    setLastWeldBanner(`Weld: ${WELD_PLANE_LABELS[selectedToggle.nextPlane]}`);
+  }, [selectedToggle, weldToggles.length, blocks, connectionModes, blockWeldOverrides, commitChange]);
 
   // Center the view on the current structure
   const centerViewOnBlocks = useCallback(
@@ -568,6 +676,10 @@ export default function App() {
         moveEraseCursor(dir);
         return;
       }
+      if (toolMode === 'welds') {
+        moveWeldCursor(dir);
+        return;
+      }
       setInputMode('keyboard');
       setLastBuildDir(dir);
 
@@ -619,7 +731,7 @@ export default function App() {
         };
       });
     },
-    [blocks, selectedBlockId, toolMode, moveEraseCursor]
+    [blocks, selectedBlockId, toolMode, moveEraseCursor, moveWeldCursor]
   );
 
   // Step-extrude from the currently selected (or last) block along one of the 6 isometric directions
@@ -711,6 +823,13 @@ export default function App() {
           setSelectedBlockId(blocks[blocks.length - 1]?.id ?? null);
         }
         setLastWeldBanner(isTouch ? 'Erase: use the arrows to pick a block, then press −' : 'Erase: arrows pick a block, Space/Delete removes it (or click a block)');
+      } else if (mode === 'welds') {
+        setSelectedJointKey(null); // re-picks the weld nearest the current block
+        setLastWeldBanner(
+          isTouch
+            ? 'Welds: arrows jump between welds, center button toggles'
+            : 'Welds: arrows / Tab jump between welds, W toggles (or click a weld twice)'
+        );
       } else {
         const anchor = blocks.find((b) => b.id === selectedBlockId) ?? blocks[blocks.length - 1];
         syncKbGhostFromBlock(anchor, lastBuildDir);
@@ -900,6 +1019,23 @@ export default function App() {
       return;
     }
 
+    if (toolMode === 'welds') {
+      if (!world) return;
+      let nearest: WeldJointToggle | null = null;
+      let best = (BASE_SCALE * 1.1) ** 2;
+      for (const t of weldToggles) {
+        const d = (t.joint.center.x - world.x) ** 2 + (t.joint.center.y - world.y) ** 2;
+        if (d < best) {
+          best = d;
+          nearest = t;
+        }
+      }
+      if (!nearest) return;
+      if (nearest.joint.key === selectedJointKey) toggleSelectedWeld();
+      else setSelectedJointKey(nearest.joint.key);
+      return;
+    }
+
     if (toolMode === 'build') {
       const cand = world
         ? findBestGhostCandidate(world.x, world.y, blocks, orientation, BASE_SCALE)
@@ -1045,15 +1181,25 @@ export default function App() {
       }
       if (e.key.toLowerCase() === 'w') {
         e.preventDefault();
-        handleToggleBlockWeldPlane();
+        if (toolMode === 'welds') toggleSelectedWeld();
+        else handleToggleBlockWeldPlane();
+        return;
+      }
+      if (toolMode === 'welds' && e.key === 'Tab') {
+        e.preventDefault();
+        cycleWeldCursor(e.shiftKey ? -1 : 1);
         return;
       }
 
       // Spacebar places the block at the current ghost position
-      if (e.code === 'Space' || e.key === ' ') {
+      if (e.code === 'Space' || e.key === ' ' || (toolMode === 'welds' && e.key === 'Enter')) {
         e.preventDefault();
         if (toolMode === 'erase') {
           deleteEraseTarget();
+          return;
+        }
+        if (toolMode === 'welds') {
+          toggleSelectedWeld();
           return;
         }
         setToolMode('build');
@@ -1071,12 +1217,13 @@ export default function App() {
 
       if (e.key === '1') switchTool('build');
       if (e.key === '2') switchTool('erase');
+      if (e.key === '3') switchTool('welds');
       if (e.key.toLowerCase() === 'g') setShowGrid((g) => !g);
       if (e.key.toLowerCase() === 'v') setShowVoxelSeams((v) => !v);
       if (e.key === 'Backspace' || e.key === 'Delete') {
         if (toolMode === 'erase') {
           deleteEraseTarget();
-        } else if (selectedBlockId && blocks.length > 0) {
+        } else if (toolMode !== 'welds' && selectedBlockId && blocks.length > 0) {
           removeBlockById(selectedBlockId);
         }
       }
@@ -1109,6 +1256,8 @@ export default function App() {
     toolMode,
     deleteEraseTarget,
     switchTool,
+    toggleSelectedWeld,
+    cycleWeldCursor,
   ]);
 
   // Generate clean standalone SVG string for export
@@ -1436,7 +1585,7 @@ export default function App() {
         className={`absolute inset-0 w-full h-full transition-colors duration-200 ${
           isPanning
             ? 'cursor-grabbing'
-            : isShiftHeld || toolMode === 'erase'
+            : isShiftHeld || toolMode === 'erase' || toolMode === 'welds'
               ? 'cursor-pointer'
               : 'cursor-crosshair'
         }`}
@@ -1551,8 +1700,60 @@ export default function App() {
               );
             })()}
 
+          {/* Welds mode: markers on every toggleable weld + cursor on the selected one */}
+          {toolMode === 'welds' && (
+            <g className="pointer-events-none">
+              {weldToggles.map((t) => (
+                <circle
+                  key={t.joint.key}
+                  cx={t.joint.center.x}
+                  cy={t.joint.center.y}
+                  r={t.joint.key === selectedToggle?.joint.key ? 0 : 5}
+                  fill="#06b6d4"
+                  fillOpacity={0.85}
+                  stroke="#083344"
+                  strokeWidth={1.5}
+                />
+              ))}
+              {selectedToggle &&
+                (() => {
+                  const { joint } = selectedToggle;
+                  return (
+                    <g>
+                      {joint.blockIds.map((id) => {
+                        const b = blocks.find((blk) => blk.id === id);
+                        if (!b) return null;
+                        const lc = blockToLattice(b.x, b.y, b.z);
+                        const r = getBlockRhombuses(lc.u, lc.v, orientation, BASE_SCALE);
+                        return [r.faceX, r.faceY, r.faceZ].map((pts, i) => (
+                          <polygon
+                            key={`${id}_${i}`}
+                            points={pointsToSvgPolygon(pts)}
+                            fill="none"
+                            stroke="#06b6d4"
+                            strokeOpacity={0.75}
+                            strokeWidth={1.5}
+                            strokeDasharray="5 4"
+                            strokeLinejoin="round"
+                          />
+                        ));
+                      })}
+                      <circle cx={joint.center.x} cy={joint.center.y} r={11} fill="none" stroke="#06b6d4" strokeWidth={3} />
+                      <circle cx={joint.center.x} cy={joint.center.y} r={4} fill="#06b6d4" stroke="#083344" strokeWidth={1.5} />
+                      <g transform={`translate(${joint.center.x}, ${joint.center.y - 34})`}>
+                        <rect x={-118} y={-12} width={236} height={22} rx={11} fill="#09090b" fillOpacity={0.92} stroke="#06b6d4" strokeWidth={1.5} />
+                        <text x={0} y={3} textAnchor="middle" fill="#67e8f9" fontSize={10} fontWeight="bold">
+                          {`${WELD_PLANE_SHORT[joint.plane]} now · ${isTouch ? 'tap ⟲' : 'W'} → ${WELD_PLANE_SHORT[selectedToggle.nextPlane]}`}
+                        </text>
+                      </g>
+                    </g>
+                  );
+                })()}
+            </g>
+          )}
+
           {/* Selected Block Anchor Dot */}
-          {selectedBlockId && scene.blockScreenCenters.has(selectedBlockId) && (
+          {toolMode !== 'welds' && selectedBlockId && scene.blockScreenCenters.has(selectedBlockId) && (
             <circle
               cx={scene.blockScreenCenters.get(selectedBlockId)!.x}
               cy={scene.blockScreenCenters.get(selectedBlockId)!.y}
@@ -1726,12 +1927,26 @@ export default function App() {
             <Eraser className="w-4 h-4" />
             Erase
           </button>
+          <button
+            onClick={() => switchTool('welds')}
+            className={`h-10 px-3 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition ${
+              toolMode === 'welds' ? 'bg-cyan-500 text-neutral-950' : 'text-neutral-300 hover:text-white'
+            }`}
+            title="Welds mode: arrows jump between toggleable welds, W toggles (key 3)"
+          >
+            <Zap className="w-4 h-4" />
+            Welds
+          </button>
         </div>
         <button
-          onClick={toggleLastBlockWeld}
-          disabled={blocks.length === 0}
+          onClick={toolMode === 'welds' ? toggleSelectedWeld : toggleLastBlockWeld}
+          disabled={toolMode === 'welds' ? !selectedToggle : blocks.length === 0}
           className={`${ctrlBtn} h-12 px-3.5 gap-2 text-xs font-semibold text-cyan-200 border-cyan-500/40 disabled:opacity-40`}
-          title="Toggle the weld plane at the last block you added (W / Shift+Click)"
+          title={
+            toolMode === 'welds'
+              ? 'Toggle the selected weld (W)'
+              : 'Toggle the weld plane at the last block you added (W / Shift+Click)'
+          }
         >
           <FlipHorizontal2 className="w-4 h-4 text-cyan-400" />
           Toggle Weld
@@ -1788,6 +2003,15 @@ export default function App() {
               aria-label="Delete selected block"
             >
               <Minus className="w-7 h-7 stroke-[3]" />
+            </button>
+          ) : toolMode === 'welds' ? (
+            <button
+              onClick={toggleSelectedWeld}
+              disabled={!selectedToggle}
+              className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-14 h-14 rounded-full bg-cyan-500 hover:bg-cyan-400 active:scale-95 text-neutral-950 shadow-lg shadow-cyan-500/30 flex items-center justify-center transition disabled:opacity-40"
+              aria-label="Toggle selected weld"
+            >
+              <FlipHorizontal2 className="w-7 h-7 stroke-[2.5]" />
             </button>
           ) : (
             <button
@@ -2303,6 +2527,13 @@ export default function App() {
                 <span className="text-cyan-300 font-semibold">Shift + Click</span> any block to
                 change which face plane welds at an impossible joint (or use the Toggle Weld
                 button for the last block you added).
+              </p>
+              <p>
+                <strong>4. Welds Mode:</strong> Switch to{' '}
+                <span className="text-cyan-300 font-semibold">Welds</span> (key 3) to jump a cyan
+                cursor between every weld you can toggle using the arrow keys (or Tab), then press{' '}
+                <span className="text-cyan-300 font-semibold">W</span> to cycle which face welds in
+                front. Clicking a weld selects it; clicking it again toggles it.
               </p>
             </div>
             <div className="pt-2 flex justify-end">

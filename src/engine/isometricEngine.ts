@@ -9,6 +9,7 @@ import {
   ViewOrientation,
   VoxelBlock,
 } from '../types/escher';
+import { REALIZABLE_VERTEX_PATTERNS } from './realizablePatterns';
 
 export const SQRT3 = Math.sqrt(3);
 export const BASE_SCALE = 54;
@@ -246,29 +247,32 @@ export function buildEscherScene(
 
   const rawCandidates: RawEscherCandidate[] = [];
 
+  // Only lattice-adjacent pairs can interact; index blocks by cell so each block checks its 6 neighbors.
+  const blocksByCell = new Map<string, number[]>();
+  blocks.forEach((b, idx) => {
+    const lc = blockLattice.get(b.id)!;
+    const k = `${lc.u},${lc.v}`;
+    const list = blocksByCell.get(k);
+    if (list) list.push(idx);
+    else blocksByCell.set(k, [idx]);
+  });
+  const DIR_ENTRIES = Object.entries(AXIS_DELTAS) as [AxisDirection, (typeof AXIS_DELTAS)[AxisDirection]][];
+
   for (let i = 0; i < blocks.length; i++) {
     const a = blocks[i];
     const la = blockLattice.get(a.id)!;
 
-    for (let j = i + 1; j < blocks.length; j++) {
-      const b = blocks[j];
-      const lb = blockLattice.get(b.id)!;
-
-      const du = lb.u - la.u;
-      const dv = lb.v - la.v;
-
-      let matchedDirFromA: AxisDirection | null = null;
-      for (const [dir, info] of Object.entries(AXIS_DELTAS) as [
-        AxisDirection,
-        (typeof AXIS_DELTAS)[AxisDirection],
-      ][]) {
-        if (info.du === du && info.dv === dv) {
-          matchedDirFromA = dir;
-          break;
-        }
+    // Same visiting order as a plain j > i scan.
+    const later: { j: number; dir: AxisDirection }[] = [];
+    for (const [dir, info] of DIR_ENTRIES) {
+      for (const j of blocksByCell.get(`${la.u + info.du},${la.v + info.dv}`) ?? []) {
+        if (j > i) later.push({ j, dir });
       }
+    }
+    later.sort((p, q) => p.j - q.j);
 
-      if (!matchedDirFromA) continue;
+    for (const { j, dir: matchedDirFromA } of later) {
+      const b = blocks[j];
 
       const info = AXIS_DELTAS[matchedDirFromA];
       const kx = b.x - a.x - info.dx;
@@ -355,9 +359,22 @@ export function buildEscherScene(
   // If block B has two candidate Escher edges to M and A where (M, A) is a real 3D edge,
   // keep only the true corner weld (collinear with B's arm or larger |kGap|).
   const discardedIds = new Set<string>();
+  const candidatesByBlock = new Map<string, number[]>();
+  nonCornerCandidates.forEach((c, idx) => {
+    for (const id of [c.normA.id, c.normB.id]) {
+      const list = candidatesByBlock.get(id);
+      if (list) list.push(idx);
+      else candidatesByBlock.set(id, [idx]);
+    }
+  });
   for (let i = 0; i < nonCornerCandidates.length; i++) {
-    for (let j = i + 1; j < nonCornerCandidates.length; j++) {
-      const c1 = nonCornerCandidates[i];
+    const c1 = nonCornerCandidates[i];
+    const partners = [
+      ...new Set([...(candidatesByBlock.get(c1.normA.id) ?? []), ...(candidatesByBlock.get(c1.normB.id) ?? [])]),
+    ]
+      .filter((j) => j > i)
+      .sort((p, q) => p - q);
+    for (const j of partners) {
       const c2 = nonCornerCandidates[j];
 
       // Find shared block B and the other two blocks M, A
@@ -798,9 +815,12 @@ export function buildEscherScene(
     return false;
   }
 
-  // 4. Resolve the winning block and faceType for each occupied 2D unit triangle
+  // 4. Resolve the winning block and faceType for each occupied 2D unit triangle.
+  // 4a. Each triangle proposes a preferred winner from the weld/depth rules, plus a ranked list of
+  //     alternatives (other unburied claims cost 1, buried internal faces cost 3).
   const winningClaims = new Map<string, TriangleClaim>();
   const renderedTriangles: RenderedTriangle[] = [];
+  const claimOptions = new Map<string, { claim: TriangleClaim; cost: number }[]>();
 
   for (const [key, allClaims] of triangleClaims.entries()) {
     const visible = allClaims.filter((c) => !isClaimBuried(c, allClaims));
@@ -813,6 +833,26 @@ export function buildEscherScene(
     }
     winningClaims.set(key, winner);
 
+    const options = [{ claim: winner, cost: 0 }];
+    for (const c of allClaims) {
+      if (options.some((o) => o.claim.blockId === c.blockId && o.claim.faceType === c.faceType)) continue;
+      options.push({ claim: c, cost: visible.includes(c) ? 1 : 3 });
+    }
+    claimOptions.set(key, options.slice(0, 4));
+  }
+
+  // 4b. Local consistency repair. Each 3-block weld joint picks its plane on its own, but up to six
+  //     joints meet around a single lattice vertex; some combinations produce a vertex no cube
+  //     arrangement could draw (a stray triangle or notch). Re-pick the six triangles around each such
+  //     vertex, choosing the closest option to the preferred winners that makes it (and its neighbors)
+  //     locally realizable.
+  repairLocalConsistency(winningClaims, claimOptions, (a, b) => {
+    if (a.faceType !== b.faceType) return true;
+    if (a.blockId === b.blockId) return false;
+    return !shouldMergeSameFaceEdge(a.blockId, b.blockId, a.faceType);
+  });
+
+  for (const [key, winner] of winningClaims.entries()) {
     const meta = triangleMeta.get(key)!;
     const { kind, cu, cv } = meta;
     const p1 = latticeToScreen(cu, cv, orientation, scale);
@@ -998,6 +1038,166 @@ export function buildEscherScene(
     blockScreenCenters,
     weldJoints,
   };
+}
+
+/** The 6 triangles around lattice vertex (u, v), in ring order (see realizablePatterns.ts). */
+function ringTriangleKeys(u: number, v: number): string[] {
+  return [
+    `A:${u},${v}`,
+    `B:${u},${v}`,
+    `A:${u - 1},${v}`,
+    `B:${u - 1},${v - 1}`,
+    `A:${u - 1},${v - 1}`,
+    `B:${u},${v - 1}`,
+  ];
+}
+
+const RING_NEIGHBORS: [number, number][] = [
+  [1, 0],
+  [1, 1],
+  [0, 1],
+  [-1, 0],
+  [-1, -1],
+  [0, -1],
+];
+
+/** Vertex patterns packed into 18 bits: per ring triangle, (face code * 2 + line bit) << 3i. */
+const FACE_CODE: Record<string, number> = { '.': 0, X: 1, Y: 2, Z: 3 };
+const REALIZABLE_CODES: ReadonlySet<number> = new Set(
+  [...REALIZABLE_VERTEX_PATTERNS].map((p) => {
+    let code = 0;
+    for (let i = 0; i < 6; i++) code |= (FACE_CODE[p[2 * i]] * 2 + (p[2 * i + 1] === '|' ? 1 : 0)) << (3 * i);
+    return code;
+  })
+);
+
+/**
+ * Makes every lattice vertex locally realizable (see realizablePatterns.ts) by re-picking triangle
+ * winners among their claim options, preferring the cheapest deviation from the current winners.
+ * Only strict improvements are applied, so it always terminates.
+ */
+function repairLocalConsistency<C extends { blockId: string; faceType: FaceType }>(
+  winners: Map<string, C>,
+  options: Map<string, { claim: C; cost: number }[]>,
+  needsLine: (a: C, b: C) => boolean
+): void {
+  const lineCache = new Map<C, Map<C, boolean>>();
+  const hasLine = (a: C | undefined, b: C | undefined): boolean => {
+    if (!a && !b) return false;
+    if (!a || !b) return true;
+    let row = lineCache.get(a);
+    if (!row) {
+      row = new Map();
+      lineCache.set(a, row);
+    }
+    let r = row.get(b);
+    if (r === undefined) {
+      r = needsLine(a, b);
+      row.set(b, r);
+    }
+    return r;
+  };
+  const isBad = (u: number, v: number): boolean => {
+    const keys = ringTriangleKeys(u, v);
+    const tris = keys.map((k) => winners.get(k));
+    let code = 0;
+    for (let i = 0; i < 6; i++) {
+      const a = tris[i];
+      code |= ((a ? FACE_CODE[a.faceType] : 0) * 2 + (hasLine(a, tris[(i + 1) % 6]) ? 1 : 0)) << (3 * i);
+    }
+    return !REALIZABLE_CODES.has(code);
+  };
+
+  const queue: [number, number][] = [];
+  const seenVertex = new Set<string>();
+  for (const key of winners.keys()) {
+    const [kind, rest] = key.split(':');
+    const [cu, cv] = rest.split(',').map(Number);
+    const verts: [number, number][] =
+      kind === 'A'
+        ? [[cu, cv], [cu + 1, cv], [cu + 1, cv + 1]]
+        : [[cu, cv], [cu + 1, cv + 1], [cu, cv + 1]];
+    for (const [u, v] of verts) {
+      const vk = `${u},${v}`;
+      if (seenVertex.has(vk)) continue;
+      seenVertex.add(vk);
+      if (isBad(u, v)) queue.push([u, v]);
+    }
+  }
+
+  const vertsOfTriangle = (key: string): [number, number][] => {
+    const [kind, rest] = key.split(':');
+    const [cu, cv] = rest.split(',').map(Number);
+    return kind === 'A'
+      ? [[cu, cv], [cu + 1, cv], [cu + 1, cv + 1]]
+      : [[cu, cv], [cu + 1, cv + 1], [cu, cv + 1]];
+  };
+  const costOf = (k: string, c: C) => options.get(k)!.find((o) => o.claim === c)?.cost ?? 0;
+
+  /** Exhaustive branch-and-bound over the winners of `keys`; applies the result if it strictly
+   *  reduces the number of unrealizable vertices touched by the window. */
+  const tryWindow = (keys: string[]): [number, number][] | null => {
+    const vmap = new Map<string, [number, number]>();
+    for (const k of keys) for (const p of vertsOfTriangle(k)) vmap.set(`${p[0]},${p[1]}`, p);
+    const verts = [...vmap.values()];
+    // A vertex can be judged once the last of its window triangles has been assigned.
+    const checkAt: [number, number][][] = keys.map(() => []);
+    for (const p of verts) {
+      const ring = new Set(ringTriangleKeys(p[0], p[1]));
+      let last = -1;
+      keys.forEach((k, i) => {
+        if (ring.has(k)) last = i;
+      });
+      checkAt[last].push(p);
+    }
+    const original = keys.map((k) => winners.get(k)!);
+    const startBad = verts.reduce((n, [a, b]) => n + (isBad(a, b) ? 1 : 0), 0);
+    let bestBad = startBad;
+    let bestCost = keys.reduce((s, k, i) => s + costOf(k, original[i]), 0);
+    let best = original.slice();
+    const pick = original.slice();
+
+    const search = (i: number, bad: number, cost: number) => {
+      if (bad > bestBad || (bad === bestBad && cost >= bestCost)) return;
+      if (i === keys.length) {
+        bestBad = bad;
+        bestCost = cost;
+        best = pick.slice();
+        return;
+      }
+      for (const o of options.get(keys[i])!) {
+        pick[i] = o.claim;
+        winners.set(keys[i], o.claim);
+        let b = bad;
+        for (const [a, c] of checkAt[i]) if (isBad(a, c)) b++;
+        search(i + 1, b, cost + o.cost);
+      }
+      winners.set(keys[i], original[i]);
+    };
+    search(0, 0, 0);
+
+    const improved = bestBad < startBad;
+    keys.forEach((k, i) => winners.set(k, improved ? best[i] : original[i]));
+    return improved ? verts : null;
+  };
+
+  let budget = queue.length * 4 + 16;
+  while (queue.length > 0 && budget-- > 0) {
+    const [u, v] = queue.shift()!;
+    if (!isBad(u, v)) continue;
+
+    const own = ringTriangleKeys(u, v).filter((k) => options.has(k));
+    let touched = tryWindow(own);
+    // Some artifacts (e.g. a block hidden on all six sides) need two neighboring vertices re-picked together.
+    for (let n = 0; !touched && n < RING_NEIGHBORS.length; n++) {
+      const [du, dv] = RING_NEIGHBORS[n];
+      const extra = ringTriangleKeys(u + du, v + dv).filter((k) => options.has(k) && !own.includes(k));
+      if (extra.length > 0) touched = tryWindow([...own, ...extra]);
+    }
+    if (touched) {
+      for (const [au, av] of touched) if (isBad(au, av)) queue.push([au, av]);
+    }
+  }
 }
 
 /**
@@ -1245,6 +1445,61 @@ export function findWeldJointForBlock(
   return dist(nearest) <= (BASE_SCALE * 1.2) ** 2 ? nearest : null;
 }
 
+export interface WeldJointToggle {
+  joint: WeldJoint;
+  /** Key into blockWeldOverrides (`joint:<key>`). */
+  jointKey: string;
+  nextPlane: PositiveAxis;
+  nextOrder: number;
+}
+
+const sceneSignature = (s: EngineSceneResult) =>
+  s.triangles
+    .map((t) => `${t.key}=${t.faceType}`)
+    .sort()
+    .join('|');
+
+/**
+ * Lists every weld joint whose plane can be cycled to a different, visibly distinct look
+ * (X -> Y -> Z order, skipping planes that render identically). Each entry carries the plane that
+ * the next toggle would switch to.
+ */
+export function listToggleableJoints(
+  blocks: VoxelBlock[],
+  connectionModes: Record<string, ConnectionMode>,
+  blockWeldOverrides: Record<string, BlockWeldOverride>,
+  orientation: ViewOrientation,
+  scene: EngineSceneResult = buildEscherScene(blocks, connectionModes, orientation, BASE_SCALE, blockWeldOverrides)
+): WeldJointToggle[] {
+  let maxOrder = 0;
+  for (const ov of Object.values(blockWeldOverrides)) {
+    if (ov.order > maxOrder) maxOrder = ov.order;
+  }
+  const nextOrder = maxOrder + 1;
+  const currentSig = sceneSignature(scene);
+  const order: PositiveAxis[] = ['X', 'Y', 'Z'];
+  const result: WeldJointToggle[] = [];
+
+  for (const joint of scene.weldJoints) {
+    if (joint.validPlanes.length < 2) continue;
+    const jointKey = `joint:${joint.key}`;
+    const start = order.indexOf(joint.plane);
+    for (let offset = 1; offset < order.length; offset++) {
+      const candidate = order[(start + offset) % order.length];
+      if (!joint.validPlanes.includes(candidate)) continue;
+      const test = buildEscherScene(blocks, connectionModes, orientation, BASE_SCALE, {
+        ...blockWeldOverrides,
+        [jointKey]: { plane: candidate, order: nextOrder },
+      });
+      if (sceneSignature(test) !== currentSig) {
+        result.push({ joint, jointKey, nextPlane: candidate, nextOrder });
+        break;
+      }
+    }
+  }
+  return result;
+}
+
 /**
  * Shift+Click: cycles the nearest weld joint to the next coherent plane (X -> Y -> Z) that
  * produces a visible change. Only geometrically consistent options are offered: each option
@@ -1259,35 +1514,14 @@ export function getNextWeldJointToggle(
   point?: ScreenPoint | null
 ): { jointKey: string; nextPlane: PositiveAxis; nextOrder: number } | null {
   const scene = buildEscherScene(blocks, connectionModes, orientation, BASE_SCALE, blockWeldOverrides);
-  const joint = findWeldJointForBlock(scene, targetBlockId, point);
-  if (!joint || joint.validPlanes.length < 2) return null;
-
-  let maxOrder = 0;
-  for (const ov of Object.values(blockWeldOverrides)) {
-    if (ov.order > maxOrder) maxOrder = ov.order;
-  }
-  const nextOrder = maxOrder + 1;
-  const jointKey = `joint:${joint.key}`;
-
-  const signature = (s: EngineSceneResult) =>
-    s.triangles
-      .map((t) => `${t.key}=${t.faceType}`)
-      .sort()
-      .join('|');
-  const currentSig = signature(scene);
-
-  const order: PositiveAxis[] = ['X', 'Y', 'Z'];
-  const start = order.indexOf(joint.plane);
-  for (let offset = 1; offset < order.length; offset++) {
-    const candidate = order[(start + offset) % order.length];
-    if (!joint.validPlanes.includes(candidate)) continue;
-    const test = buildEscherScene(blocks, connectionModes, orientation, BASE_SCALE, {
-      ...blockWeldOverrides,
-      [jointKey]: { plane: candidate, order: nextOrder },
-    });
-    if (signature(test) !== currentSig) {
-      return { jointKey, nextPlane: candidate, nextOrder };
-    }
-  }
-  return null;
+  const toggles = listToggleableJoints(blocks, connectionModes, blockWeldOverrides, orientation, scene);
+  if (toggles.length === 0) return null;
+  // Reuse the Shift+Click targeting rules, restricted to joints that actually change the picture.
+  const joint = findWeldJointForBlock(
+    { ...scene, weldJoints: toggles.map((t) => t.joint) },
+    targetBlockId,
+    point
+  );
+  const hit = joint ? toggles.find((t) => t.joint.key === joint.key) : undefined;
+  return hit ? { jointKey: hit.jointKey, nextPlane: hit.nextPlane, nextOrder: hit.nextOrder } : null;
 }

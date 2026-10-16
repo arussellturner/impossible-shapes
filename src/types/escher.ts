@@ -58,4 +58,4 @@ export interface ShapePreset {
   connectionOverrides?: Record<string, ConnectionMode>;
 }
 
-export type ToolMode = 'build' | 'erase' | 'connect';
+export type ToolMode = 'build' | 'erase' | 'welds' | 'connect';
