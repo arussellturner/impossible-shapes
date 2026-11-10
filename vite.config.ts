@@ -126,7 +126,7 @@ function attachSuggestionEndpoint(
             Authorization: `Bearer ${token}`,
             Accept: 'application/vnd.github+json',
             'Content-Type': 'application/json',
-            'User-Agent': 'EscherCAD-Suggestion-Bot',
+            'User-Agent': 'MCSketcher-Suggestion-Bot',
           },
           body: JSON.stringify({
             title: issueTitle,

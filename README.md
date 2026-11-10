@@ -1,4 +1,4 @@
-# EscherCAD — Isometric Impossible Shape Studio
+# MC Sketcher — Isometric Impossible Shape Studio
 
 An interactive 3D isometric voxel editor for designing **M.C. Escher** and **Penrose** "impossible shapes" in the browser.
 

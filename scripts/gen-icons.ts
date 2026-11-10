@@ -1,5 +1,5 @@
 // Generates the app icons from the engine's own Penrose tribar rendering, so the icon always
-// matches what EscherCAD draws.
+// matches what MC Sketcher draws.
 //   npx esbuild scripts/gen-icons.ts --bundle --platform=node --outfile=/tmp/gen-icons.cjs && node /tmp/gen-icons.cjs public
 // PNG versions (apple-touch-icon etc.) are rasterized from icon-square.svg with headless Chrome.
 import { mkdirSync, writeFileSync } from 'fs';

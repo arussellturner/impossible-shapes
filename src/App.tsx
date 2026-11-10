@@ -2041,7 +2041,7 @@ export default function App() {
                   <Box className="w-5 h-5 stroke-[2.5]" />
                 </div>
                 <div>
-                  <h1 className="text-base font-bold tracking-tight text-white">EscherCAD</h1>
+                  <h1 className="text-base font-bold tracking-tight text-white">MC Sketcher</h1>
                   <p className="text-xs text-neutral-400">Impossible Shape Studio</p>
                 </div>
               </div>
@@ -2405,7 +2405,7 @@ export default function App() {
                     rows={4}
                     value={suggestionDescription}
                     onChange={(e) => setSuggestionDescription(e.target.value)}
-                    placeholder="Describe how we can improve EscherCAD, what workflow you'd like to see, or what behaved unexpectedly..."
+                    placeholder="Describe how we can improve MC Sketcher, what workflow you'd like to see, or what behaved unexpectedly..."
                     className="w-full px-3 py-2 rounded-xl bg-neutral-950 border border-neutral-800 focus:border-cyan-400 focus:outline-none text-xs text-white placeholder-neutral-500 resize-y"
                   />
                 </div>
@@ -2515,7 +2515,7 @@ export default function App() {
               </p>
               <p>
                 <strong>2. Automatic Escher Welds (⚡):</strong> Whenever a newly placed block
-                visually touches another block at a different 3D depth, EscherCAD automatically
+                visually touches another block at a different 3D depth, MC Sketcher automatically
                 welds them together—merging their coplanar faces and weaving their local depth order
                 to create seamless M.C. Escher &amp; Penrose illusions.
               </p>
