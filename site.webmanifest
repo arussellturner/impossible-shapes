@@ -1,6 +1,6 @@
 {
-  "name": "EscherCAD — Impossible Shape Studio",
-  "short_name": "EscherCAD",
+  "name": "MC Sketcher — Impossible Shape Studio",
+  "short_name": "MC Sketcher",
   "description": "Interactive isometric block builder for M.C. Escher & Penrose impossible shapes",
   "start_url": "./",
   "scope": "./",
